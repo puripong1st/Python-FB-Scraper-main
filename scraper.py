@@ -3,6 +3,11 @@ scraper.py
 ━━━━━━━━━━
 FacebookScraper — เปิด Browser, Login, สแกนเพจ, ส่งแจ้งเตือน
 ใช้ undetected-chromedriver เพื่อหลีกเลี่ยง bot detection
+
+การแก้ไข:
+  - เปลี่ยนไอคอน Browser เฉพาะหน้าต่างที่ Scraper เปิด ด้วย ctypes (ไม่ต้องใช้ pywin32)
+  - ดึงทุกโพสต์รวมโพสต์สั้น — ตรวจ keyword จาก allText ด้วย
+  - กรองเฉพาะโพสต์ ไม่ดึงคอมเมนต์ (กรอง top-level article เท่านั้น)
 """
 
 import threading
@@ -14,14 +19,6 @@ import random
 import hashlib
 import sys
 from datetime import datetime, timedelta
-
-try:
-    import win32gui
-    import win32con
-    import win32ui
-    WIN32_AVAILABLE = True
-except ImportError:
-    WIN32_AVAILABLE = False
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -80,9 +77,12 @@ class FacebookScraper:
         self._resume_event.set()
         self._is_paused = False
 
-        self._browser_hidden = False   # สถานะซ่อน/แสดง browser
-        self._consecutive_failures = 0 # นับรอบที่ล้มเหลวติดต่อกัน
-        self._cycle_count = 0          # นับรอบสแกนทั้งหมด
+        self._browser_hidden = False
+        self._consecutive_failures = 0
+        self._cycle_count = 0
+
+        # เก็บ PID ของ chromedriver ที่ scraper เปิด เพื่อกรองเฉพาะหน้าต่างของเราเท่านั้น
+        self._scraper_chrome_pids: set = set()
 
     # ── Thread-safe driver property ───────────────────────────────────────────
 
@@ -96,99 +96,99 @@ class FacebookScraper:
         with self._driver_lock:
             self._driver = value
 
-    # ── Browser hide / show (Windows ctypes) ─────────────────────────────────
+    # ── Browser hide / show ───────────────────────────────────────────────────
 
     def _collect_chrome_pids(self) -> set:
-        """รวบรวม PID ของ Chrome.exe ทั้งหมดที่ chromedriver เปิดขึ้น (BFS จาก root PID)"""
+        """เก็บ chrome.exe PIDs ที่เพิ่งเปิดขึ้นมาใหม่หลัง browser launch
+        วิธี: snapshot PIDs ก่อน launch ไว้ใน _chrome_pids_before แล้ว diff
+        ถ้าไม่มี snapshot fallback ใช้ child-tree จาก chromedriver PID
+        """
         try:
+            import subprocess, json as _json
+
+            def _all_chrome_pids() -> set:
+                res = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-WmiObject Win32_Process | Where-Object {$_.Name -eq 'chrome.exe'} "
+                     "| Select-Object ProcessId | ConvertTo-Json"],
+                    capture_output=True, text=True, timeout=10
+                )
+                if not res.stdout.strip():
+                    return set()
+                procs = _json.loads(res.stdout)
+                if isinstance(procs, dict):
+                    procs = [procs]
+                return {int(p["ProcessId"]) for p in procs if p.get("ProcessId")}
+
+            before: set = getattr(self, '_chrome_pids_before', set())
+            after  = _all_chrome_pids()
+            new_pids = after - before  # PIDs ที่เพิ่มขึ้นหลัง launch
+
+            if new_pids:
+                self._scraper_chrome_pids = new_pids
+                self.log(f"🔍 Chrome PIDs ที่ Scraper เปิด: {new_pids}")
+                return new_pids
+
+            # fallback — ใช้ child-tree จาก chromedriver (วิธีเดิม)
             drv = self.driver
-            if not drv:
-                return set()
-
-            import subprocess
-            root_pid = drv.service.process.pid
-            pids: set = {root_pid}
-
-            # ลอง wmic ก่อน (Windows 10) → fallback tasklist (Windows 11)
-            children: dict = {}
-            for cmd, parser in [
-                (
-                    ["wmic", "process", "get", "ProcessId,ParentProcessId,Name"],
-                    "wmic",
-                ),
-                (
-                    ["tasklist", "/FO", "CSV", "/NH"],
-                    "tasklist",
-                ),
-            ]:
-                try:
-                    result = subprocess.run(
-                        cmd, capture_output=True, text=True, timeout=5
-                    )
-                    if result.returncode != 0 or not result.stdout.strip():
-                        continue
-
-                    if parser == "wmic":
-                        for line in result.stdout.strip().split("\n")[1:]:
-                            parts = line.strip().split()
-                            if len(parts) >= 2 and parts[-1].isdigit() and parts[-2].isdigit():
-                                ppid = int(parts[-2])
-                                cpid = int(parts[-1])
-                                children.setdefault(ppid, []).append(cpid)
-                    else:
-                        # tasklist ไม่มี PPID ดังนั้นใช้ PowerShell แทน
-                        ps_result = subprocess.run(
-                            ["powershell", "-NoProfile", "-Command",
-                             "Get-WmiObject Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Csv -NoTypeInformation"],
-                            capture_output=True, text=True, timeout=8
-                        )
-                        for line in ps_result.stdout.strip().split("\n")[1:]:
-                            line = line.strip().strip('"')
-                            parts = [p.strip('"') for p in line.split('","')]
-                            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-                                cpid = int(parts[0])
-                                ppid = int(parts[1])
-                                children.setdefault(ppid, []).append(cpid)
-
-                    if children:
-                        break
-                except Exception:
-                    continue
-
-            queue = [root_pid]
-            while queue:
-                p = queue.pop()
-                for cpid in children.get(p, []):
-                    if cpid not in pids:
-                        pids.add(cpid)
-                        queue.append(cpid)
-            return pids
+            if drv:
+                root_pid = drv.service.process.pid
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-WmiObject Win32_Process | Where-Object {$_.Name -eq 'chrome.exe'} "
+                     "| Select-Object ProcessId,ParentProcessId | ConvertTo-Json"],
+                    capture_output=True, text=True, timeout=10
+                )
+                if result.stdout.strip():
+                    procs = _json.loads(result.stdout)
+                    if isinstance(procs, dict):
+                        procs = [procs]
+                    pids = {root_pid}
+                    queue = [root_pid]
+                    while queue:
+                        p = queue.pop()
+                        for proc in procs:
+                            ppid = int(proc.get("ParentProcessId") or 0)
+                            cpid = int(proc.get("ProcessId") or 0)
+                            if ppid == p and cpid not in pids:
+                                pids.add(cpid)
+                                queue.append(cpid)
+                    self._scraper_chrome_pids = pids
+                    self.log(f"🔍 Chrome PIDs (fallback tree): {pids}")
+                    return pids
+        except Exception as e:
+            self.log(f"⚠️ _collect_chrome_pids: {e}")
+        pids = set()
+        try:
+            pids = {self.driver.service.process.pid}
         except Exception:
-            return set()
+            pass
+        self._scraper_chrome_pids = pids
+        return pids
 
     def _find_browser_hwnds(self) -> list:
-        """ค้นหา HWND (window handle) ของ Chrome ทั้งหมดจาก PID ที่รวบรวมไว้"""
+        """หา HWND ของ Chrome window ที่ Scraper เปิด โดยใช้ _scraper_chrome_pids
+        ซึ่งเก็บ chrome.exe PIDs จาก snapshot diff (ไม่ใช่ chromedriver PID)
+        """
         try:
-            import ctypes
-            import ctypes.wintypes
+            import ctypes, ctypes.wintypes
+            pids = self._scraper_chrome_pids  # ชุด chrome.exe PIDs ที่ scraper เปิด
 
-            pids = self._collect_chrome_pids()
-            if not pids:
-                return []
-
-            found: list = []
-            EnumProc = ctypes.WINFUNCTYPE(
-                ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
-            )
+            found = []
+            EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
 
             def _cb(hwnd, _):
+                cls = ctypes.create_unicode_buffer(64)
+                ctypes.windll.user32.GetClassNameW(hwnd, cls, 64)
+                if cls.value not in ("Chrome_WidgetWin_1", "Chrome_WidgetWin_0"):
+                    return True
                 win_pid = ctypes.c_ulong(0)
                 ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(win_pid))
-                if win_pid.value in pids:
-                    # เฉพาะ top-level window ที่มี title text เท่านั้น
-                    length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-                    if length > 0:
-                        found.append(hwnd)
+                # กรองเฉพาะ PID ที่รู้ว่าเป็นของ scraper / ถ้าไม่มีข้อมูล fallback รับทุก Chrome
+                if pids and win_pid.value not in pids:
+                    return True
+                if ctypes.windll.user32.IsWindowVisible(hwnd):
+                    found.append(hwnd)
                 return True
 
             ctypes.windll.user32.EnumWindows(EnumProc(_cb), 0)
@@ -232,63 +232,76 @@ class FacebookScraper:
             self.log(f"⚠️ show_browser: {e}")
 
     def _set_chrome_icon(self):
-        """เปลี่ยนไอคอนหน้าต่าง Chrome เป็น app_icon.ico"""
-        if not WIN32_AVAILABLE:
-            self.log("⚠️ pywin32 ไม่ติดตั้ง — ข้ามการเปลี่ยนไอคอน (pip install pywin32)")
-            return
+        """
+        เปลี่ยนไอคอน Title bar + Taskbar ของ Chrome ที่ Scraper เปิด
+        - WM_SETICON        → title bar
+        - SetClassLongPtrW  → taskbar icon (GCL_HICON)
+        """
         try:
-            # หา path ของ app_icon.ico — รองรับทั้ง run ปกติและ PyInstaller
+            import ctypes, ctypes.wintypes
+
             if getattr(sys, 'frozen', False):
-                # รันผ่าน PyInstaller
                 icon_path = os.path.join(sys._MEIPASS, "app_icon.ico")
             else:
-                # รันปกติ
-                icon_path = os.path.join(os.path.dirname(__file__), "app_icon.ico")
+                icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_icon.ico")
 
             if not os.path.exists(icon_path):
-                self.log(f"⚠️ ไม่พบไฟล์ {icon_path}")
+                self.log("⚠️ ไม่พบ app_icon.ico — ข้ามการเปลี่ยนไอคอน")
                 return
 
-            # โหลดไอคอน
-            hicon = win32gui.LoadImage(
-                None, icon_path, win32con.IMAGE_ICON,
-                32, 32, win32con.LR_LOADFROMFILE
-            )
+            IMAGE_ICON      = 1
+            LR_LOADFROMFILE = 0x0010
+            LR_DEFAULTSIZE  = 0x0040
+            WM_SETICON      = 0x0080
+            ICON_SMALL      = 0
+            ICON_BIG        = 1
+            GCL_HICON       = -14   # class icon → taskbar
+            GCL_HICONSM     = -34   # class small icon
 
-            # หา HWND ของ Chrome window — รอให้ window พร้อม
-            max_retries = 5
+            hicon_big  = ctypes.windll.user32.LoadImageW(None, icon_path, IMAGE_ICON, 32, 32, LR_LOADFROMFILE)
+            hicon_sm   = ctypes.windll.user32.LoadImageW(None, icon_path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+            hicon_task = ctypes.windll.user32.LoadImageW(None, icon_path, IMAGE_ICON,  0,  0,
+                                                     LR_LOADFROMFILE | LR_DEFAULTSIZE)
+
+            if not any([hicon_big, hicon_sm, hicon_task]):
+                self.log("⚠️ LoadImageW ล้มเหลวทุกขนาด")
+                return
+
+            # รอให้ Chrome window แสดงขึ้นมา (สูงสุด 15 วิ)
             hwnds = []
-            for retry in range(max_retries):
+            for _ in range(30):
                 hwnds = self._find_browser_hwnds()
                 if hwnds:
                     break
-                time.sleep(0.3)
+                time.sleep(0.5)
 
             if not hwnds:
-                self.log("⚠️ ไม่พบ Chrome window handles")
+                self.log("⚠️ ไม่พบหน้าต่าง Browser ที่จะเปลี่ยนไอคอน")
                 return
 
-            # ตั้งไอคอนให้ทุก window
             set_count = 0
             for hwnd in hwnds:
                 try:
-                    # ตรวจสอบว่า window พร้อมหรือยัง
-                    if win32gui.IsWindowVisible(hwnd):
-                        win32gui.SendMessage(hwnd, win32con.WM_SETICON, win32con.ICON_BIG, hicon)
-                        win32gui.SendMessage(hwnd, win32con.WM_SETICON, win32con.ICON_SMALL, hicon)
-                        set_count += 1
+                    # Title bar
+                    if hicon_big:  ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG,   hicon_big)
+                    if hicon_sm:   ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_sm)
+                    # Taskbar icon — ต้องใช้ SetClassLongPtrW
+                    if hicon_task:
+                        ctypes.windll.user32.SetClassLongPtrW(hwnd, GCL_HICON,   hicon_task)
+                        ctypes.windll.user32.SetClassLongPtrW(hwnd, GCL_HICONSM, hicon_task)
+                    set_count += 1
                 except Exception:
                     pass
 
-            if set_count > 0:
+            if set_count:
                 self.log(f"🎨 เปลี่ยนไอคอน Browser แล้ว ({set_count} หน้าต่าง)")
             else:
-                self.log("⚠️ ไม่สามารถเปลี่ยนไอคอน — window ยังไม่พร้อม")
+                self.log("⚠️ ไม่สามารถเปลี่ยนไอคอนได้")
         except Exception as e:
             self.log(f"⚠️ _set_chrome_icon: {e}")
 
     def _safe_quit_driver(self):
-        """ปิด Browser อย่างปลอดภัย — ไม่ throw exception ไม่ว่ากรณีใด"""
+        """ปิด Browser อย่างปลอดภัย"""
         drv = self.driver
         if drv is None:
             return
@@ -299,9 +312,10 @@ class FacebookScraper:
         finally:
             self.driver = None
             self._browser_hidden = False
+            self._scraper_chrome_pids = set()   # reset PID cache เมื่อปิด browser
 
     def _sleep_interruptible(self, seconds: float, step: float = 5.0):
-        """sleep ที่ตรวจ stop_event ทุก step วินาที — หยุดได้ทันทีเมื่อ stop"""
+        """sleep ที่ตรวจ stop_event ทุก step วินาที"""
         elapsed = 0.0
         while elapsed < seconds and not self._stop_event.is_set():
             chunk = min(step, seconds - elapsed)
@@ -384,27 +398,63 @@ class FacebookScraper:
         if not chrome_version:
             self.log("⚠️ ตรวจไม่พบเวอร์ชัน Chrome — จะปล่อยให้ระบบเดาอัตโนมัติ")
 
-        # 5. เปิด Browser — ลองสูงสุด 3 รอบ แต่ละรอบ cleanup ก่อนลองใหม่
+        # 5. เปิด Browser — ลองสูงสุด 3 รอบ
         strategies = []
         if chrome_version:
             strategies.append({"version_main": chrome_version})
-        strategies.append({})          # auto-detect
-        strategies.append({"version_main": None})  # ลองอีกครั้งแบบ auto
+        strategies.append({})
+        strategies.append({"version_main": None})
 
         last_err = None
         for attempt, kwargs in enumerate(strategies, 1):
-            # ลบ key ที่ value=None ออก
             kwargs = {k: v for k, v in kwargs.items() if v is not None}
             try:
                 self.log(f"🔄 เปิด Browser รอบที่ {attempt}/{len(strategies)} {kwargs or '(auto)'}")
-                self._safe_quit_driver()   # cleanup ซากจากรอบที่แล้ว
+                self._safe_quit_driver()
                 time.sleep(1)
+                # snapshot chrome.exe PIDs ก่อน launch เพื่อ diff หา PIDs ของเรา
+                try:
+                    import subprocess as _sp, json as _jj
+                    _res = _sp.run(
+                        ["powershell", "-NoProfile", "-Command",
+                         "Get-WmiObject Win32_Process | Where-Object {$_.Name -eq 'chrome.exe'} "
+                         "| Select-Object ProcessId | ConvertTo-Json"],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    if _res.stdout.strip():
+                        _pp = _jj.loads(_res.stdout)
+                        if isinstance(_pp, dict): _pp = [_pp]
+                        self._chrome_pids_before = {int(p["ProcessId"]) for p in _pp if p.get("ProcessId")}
+                    else:
+                        self._chrome_pids_before = set()
+                except Exception:
+                    self._chrome_pids_before = set()
                 self.driver = uc.Chrome(options=_make_options(), use_subprocess=True, **kwargs)
                 self.driver.set_page_load_timeout(60)
                 self.log("🌐 เปิด Browser สำเร็จ")
-                time.sleep(0.5)  # รอให้ window พร้อมก่อนเปลี่ยนไอคอน
-                self._set_chrome_icon()    # เปลี่ยนไอคอนเป็น app_icon.ico
-                return                     # ออกทันทีเมื่อสำเร็จ
+
+                # collect PID ทันทีหลังเปิด Browser — เพื่อใช้กรองหน้าต่าง
+                time.sleep(0.5)
+                self._collect_chrome_pids()
+
+                def _set_icon_with_retry(max_wait: float = 15.0, interval: float = 0.5):
+                    """รอจนกว่า Chrome window จะพร้อม แล้วค่อยเปลี่ยนไอคอน"""
+                    deadline = time.time() + max_wait
+                    while time.time() < deadline:
+                        hwnds = self._find_browser_hwnds(_debug=(time.time() > deadline - interval))
+                        if hwnds:
+                            self._set_chrome_icon()
+                            return
+                        time.sleep(interval)
+                    self.log("⚠️ _set_chrome_icon: รอ Chrome window ครบ 15 วิแล้วยังไม่พบ")
+
+                # navigate ไปหน้าแรกก่อน เพื่อให้ title bar มีข้อความและ window visible
+                try:
+                    self.driver.get(self.HOME_URL)
+                except Exception:
+                    pass
+                threading.Thread(target=_set_icon_with_retry, daemon=True).start()
+                return
             except Exception as e:
                 last_err = e
                 self.log(f"⚠️ รอบ {attempt} ล้มเหลว: {e}")
@@ -646,7 +696,7 @@ class FacebookScraper:
 
     def _handle_obstacle(self, obstacle_type: str, page_url: str = ""):
         self.log(f"🚨 ติด {obstacle_type} — หยุดรอผู้ใช้แก้ไข กด Resume เมื่อเสร็จ")
-        self.show_browser()          # ← แสดง Browser ให้ user แก้ปัญหาได้
+        self.show_browser()
         self.discord.send_obstacle(obstacle_type, page_url)
         self.tg.send_obstacle(obstacle_type, page_url)
         self._resume_event.clear()
@@ -654,7 +704,7 @@ class FacebookScraper:
         self._resume_event.wait()
         self._is_paused = False
         self.log("▶️ Resume แล้ว — กลับมาทำงานต่อ")
-        self.hide_browser()          # ← ซ่อนกลับหลัง resume
+        self.hide_browser()
 
     def resume(self):
         self._resume_event.set()
@@ -677,11 +727,11 @@ class FacebookScraper:
             r"story_fbid=(\d+)",
             r"/permalink/(\d+)",
             r"fbid=(\d+)",
-            r"/reel/(\d+)",          # Facebook Reels
-            r"[?&]v=(\d+)",          # /watch/?v=VIDEO_ID
-            r"/watch/\?v=(\d+)",     # explicit watch URL
-            r"/share/p/([^/]+)",     # New share post format: /share/p/17YTnRYsZA/
-            r"/share/([^/]+)",       # Alternate share format
+            r"/reel/(\d+)",
+            r"[?&]v=(\d+)",
+            r"/watch/\?v=(\d+)",
+            r"/share/p/([^/]+)",
+            r"/share/([^/]+)",
         ]
         for pattern in patterns:
             m = re.search(pattern, url)
@@ -689,7 +739,6 @@ class FacebookScraper:
                 return m.group(1)
         return hashlib.md5(url.encode("utf-8")).hexdigest()
 
-    # ── Thai month maps ──────────────────────────────────────────────────────
     _TH_MONTH_SHORT = {
         "ม.ค.": 1, "ก.พ.": 2, "มี.ค.": 3, "เม.ย.": 4,
         "พ.ค.": 5, "มิ.ย.": 6, "ก.ค.": 7, "ส.ค.": 8,
@@ -702,30 +751,21 @@ class FacebookScraper:
     }
 
     def _parse_thai_date(self, text: str) -> "datetime | None":
-        """
-        แปลงวันที่ภาษาไทยแบบเต็ม เช่น
-          - "15 มกราคม 2568 เวลา 09:30 น."
-          - "วันที่ 3 ก.พ. 2567"
-          - "January 15, 2025 at 09:30"
-        คืนค่า datetime หรือ None ถ้าแปลงไม่ได้
-        """
         now = datetime.now()
-        # short เช่น "3 ม.ค. 68" หรือ "3 ม.ค. 2568"
         for abbr, month in self._TH_MONTH_SHORT.items():
             if abbr in text:
                 nums = re.findall(r"\d+", text)
                 if len(nums) >= 2:
                     day  = int(nums[0])
                     year = int(nums[-1])
-                    if year > 2400:  # พ.ศ.
+                    if year > 2400:
                         year -= 543
-                    elif year < 100:  # ย่อ เช่น 68 → 2568 → 2025
+                    elif year < 100:
                         year += (2500 - 543) if year < 50 else (2400 - 543)
                     try:
                         return datetime(year, month, day)
                     except ValueError:
                         pass
-        # long เช่น "15 มกราคม 2568"
         for full, month in self._TH_MONTH_LONG.items():
             if full in text:
                 nums = re.findall(r"\d+", text)
@@ -740,7 +780,6 @@ class FacebookScraper:
                         return datetime(year, month, day)
                     except ValueError:
                         pass
-        # English เช่น "January 15, 2025"
         en_months = {
             "january": 1, "february": 2, "march": 3, "april": 4,
             "may": 5, "june": 6, "july": 7, "august": 8,
@@ -763,29 +802,19 @@ class FacebookScraper:
         return None
 
     def _parse_post_timestamp_text(self, raw_text: str, utime: int = 0, time_label: str = "") -> "datetime | None":
-        """
-        อ่านเวลาโพสต์จาก:
-        1. utime (data-utime Unix timestamp) — แม่นที่สุด
-        2. time_label (aria-label)
-        3. raw_text จาก innerText 10 บรรทัดแรก
-        คืน None เฉพาะเมื่ออ่านไม่ออกจริงๆ
-        """
         now = datetime.now()
 
-        # ── Priority 1: Unix timestamp ────────────────────────────────────────
         if utime and utime > 0:
             try:
                 return datetime.fromtimestamp(utime)
             except (OSError, OverflowError, ValueError):
                 pass
 
-        # ── Priority 2: aria-label / title ──────────────────────────────────
         if time_label:
             result = self._parse_thai_date(time_label)
             if result:
                 return result
 
-        # ── Priority 3: raw innerText ─────────────────────────────────────────
         try:
             lines = raw_text.split("\n")[:10]
             for line in lines:
@@ -799,7 +828,6 @@ class FacebookScraper:
                 if "เมื่อวาน" in tl or "yesterday" in tl:
                     return now - timedelta(days=1)
 
-                # relative time
                 m = re.search(
                     r"(\d+)\s*(นาที|ชั่วโมง|ชม\.?|วัน|สัปดาห์|เดือน|ปี|mins?|m\b|hrs?|h\b|days?|d\b|weeks?|w\b|months?|years?)",
                     tl,
@@ -814,7 +842,6 @@ class FacebookScraper:
                     elif "เดือน"   in unit or "month" in unit: return now - timedelta(days=num * 30)
                     elif "ปี"      in unit or "year" in unit: return now - timedelta(days=num * 365)
 
-                # absolute Thai date
                 result = self._parse_thai_date(text)
                 if result:
                     return result
@@ -825,52 +852,15 @@ class FacebookScraper:
         return None
 
     def _get_articles(self) -> list:
-        """ดึงเฉพาะโพสต์หลัก — ไม่รวมคอมเมนต์ รองรับทั้ง Page และ Profile"""
+        """
+        ดึงเฉพาะ div[role='article'] ระดับบนสุด (top-level posts)
+        ไม่รวม article ที่ซ้อนอยู่ข้างใน (คอมเมนต์)
+        """
         try:
-            # ใช้ selector ที่เจาะจงมากขึ้น เพื่อไม่ดึงคอมเมนต์
-            # div[role='article'] ที่มี data-ad-comet-preview=feedback คือคอมเมนต์
-            # เพิ่ม selector สำหรับ Facebook Profile (ใช้ xstyle div แทน)
-            articles = []
-
-            # Selector 1: หน้า Page ปกติ
-            articles_page = self.driver.find_elements(
+            articles = self.driver.find_elements(
                 By.XPATH,
-                "//div[@role='article' and not(@data-ad-comet-preview='feedback') "
-                "and not(ancestor::div[@data-ad-comet-preview='feedback'])]"
+                "//div[@role='article' and not(ancestor::div[@role='article'])]"
             )
-            articles.extend(articles_page)
-
-            # Selector 2: หน้า Profile (ใช้ div[class*="feed"] หรือ div[data-visualcompletion="css"])
-            if not articles:
-                articles_profile = self.driver.find_elements(
-                    By.CSS_SELECTOR,
-                    "div[xstyle*='feed'], div[data-visualcompletion='css'], div[aria-posinset]"
-                )
-                # กรองเฉพาะ element ที่เป็นโพสต์ (มีเนื้อหาหรือมีเวลา)
-                for el in articles_profile:
-                    try:
-                        text = el.get_attribute("innerText") or ""
-                        if text and len(text) > 10:
-                            # ข้ามคอมเมนต์
-                            if "data-ad-comet-preview='feedback'" not in el.get_attribute("outerHTML") or "":
-                                articles.append(el)
-                    except Exception:
-                        continue
-
-            # Selector 3: fallback — หาทุก div ที่มี data-ft (metadata ของ Facebook post)
-            if not articles:
-                articles_fallback = self.driver.find_elements(
-                    By.CSS_SELECTOR,
-                    "div[data-ft]"
-                )
-                for el in articles_fallback:
-                    try:
-                        text = el.get_attribute("innerText") or ""
-                        if text and len(text) > 20:
-                            articles.append(el)
-                    except Exception:
-                        continue
-
             return articles
         except Exception as e:
             self.log(f"⚠️ _get_articles error: {e}")
@@ -886,7 +876,7 @@ class FacebookScraper:
         consecutive_old     = 0
         seen_this_run: set  = set()
         stop_early = False
-        scroll_rounds = 0   # ← กำหนดก่อน try เพื่อป้องกัน UnboundLocalError
+        scroll_rounds = 0
 
         try:
             self.log(f"🔍 กำลังเข้าเพจ: {page_url}")
@@ -904,8 +894,8 @@ class FacebookScraper:
             last_article_count = 0
             no_growth_rounds   = 0
             MAX_NO_GROWTH      = 4
-            rounds_without_new_urls = 0      # ← นับรอบที่ scroll แล้วไม่พบ URL ใหม่เลย
-            MAX_NO_NEW_URL_ROUNDS   = 3      # ← หยุดถ้าไม่พบ URL ใหม่ติดต่อกัน N รอบ
+            rounds_without_new_urls = 0
+            MAX_NO_NEW_URL_ROUNDS   = 3
 
             while not self._stop_event.is_set() and not stop_early and scroll_rounds < MAX_SCROLL_ROUNDS:
                 self._slow_scroll(scrolls=4, pause=2.0)
@@ -936,6 +926,8 @@ class FacebookScraper:
                     self.driver.execute_script("""
                         const SEE_MORE = ['ดูเพิ่มเติม', 'see more', 'see More', 'See More', 'See more'];
                         document.querySelectorAll("div[role='article']").forEach(art => {
+                            // ข้าม article ที่ซ้อนอยู่ (คอมเมนต์)
+                            if (art.parentElement && art.parentElement.closest("div[role='article']")) return;
                             art.querySelectorAll(
                                 'div[role="button"], span[role="button"], ' +
                                 'div[class*="see_more"], div[class*="truncate"]'
@@ -951,127 +943,170 @@ class FacebookScraper:
                 except Exception as e:
                     self.log(f"⚠️ คลิก 'ดูเพิ่มเติม' ไม่สำเร็จ: {e}")
 
-                # ดึงข้อมูลจาก JS ทีเดียว
+                # ─────────────────────────────────────────────────────────────
+                # ดึงข้อมูลโพสต์ด้วย JS
+                # หลักการ:
+                #   1. เลือกเฉพาะ top-level article (ไม่ดึงคอมเมนต์)
+                #   2. ดึง postText จากหลาย selector รองรับโพสต์สั้น-ยาว
+                #   3. ส่ง allText กลับมาด้วยเพื่อใช้ตรวจ keyword ของโพสต์สั้น
+                # ─────────────────────────────────────────────────────────────
                 try:
                     article_data: list = self.driver.execute_script("""
                         const pn = arguments[0].toLowerCase();
                         const POST_PATTERNS  = ['/posts/', 'story_fbid', '/permalink/', 'fbid=', '/share/p/', '/share/'];
-                            const VIDEO_PATTERNS = ['/videos/', '/reel/', '/watch/', '?v=', '%3Fv%3D'];
-                            const ALL_PATTERNS   = [...POST_PATTERNS, ...VIDEO_PATTERNS];
-                            return Array.from(document.querySelectorAll("div[role='article']")).map(art => {
-                                let postUrl = '';
-                                const anchors = Array.from(art.querySelectorAll('a[href]'));
+                        const VIDEO_PATTERNS = ['/videos/', '/reel/', '/watch/', '?v=', '%3Fv%3D'];
+                        const ALL_PATTERNS   = [...POST_PATTERNS, ...VIDEO_PATTERNS];
 
-                                // Priority 1: post URLs (แม่นสุด)
+                        // ─── เลือกเฉพาะ article ที่เป็นโพสต์จริง ไม่เอา comment ───
+                        // Facebook render comment แต่ละอันเป็น div[role='article'] เหมือนกัน
+                        // แต่ comment article จะ:
+                        //   1. ไม่มี link ที่ match POST_PATTERNS/VIDEO_PATTERNS เลย
+                        //   2. มี ancestor ที่เป็น div[role='article'] อยู่ (nested)
+                        //   3. อยู่ใน ul/li structure (comment list)
+                        const allArts = Array.from(document.querySelectorAll("div[role='article']"));
+
+                        const topArts = allArts.filter(a => {
+                            // ตัดออกถ้าอยู่ใน nested article (comment)
+                            if (a.parentElement && a.parentElement.closest("div[role='article']"))
+                                return false;
+                            // ตัดออกถ้าอยู่ใน ul/li (comment list)
+                            if (a.closest('ul') || a.closest('li'))
+                                return false;
+                            // ต้องมี anchor ที่ match post/video pattern อย่างน้อย 1 อัน
+                            const anchors = Array.from(a.querySelectorAll('a[href]'));
+                            const hasPostLink = anchors.some(anchor => {
+                                const h = anchor.href || '';
+                                return ALL_PATTERNS.some(p => h.includes(p));
+                            });
+                            return hasPostLink;
+                        });
+
+                        return topArts.map(art => {
+                            let postUrl = '';
+                            const anchors = Array.from(art.querySelectorAll('a[href]'));
+
+                            // Priority 1: post URLs
+                            for (const a of anchors) {
+                                const h = a.href || '';
+                                if (POST_PATTERNS.some(p => h.includes(p))) { postUrl = h; break; }
+                            }
+                            // Priority 2: video/reel/watch URLs
+                            if (!postUrl) {
                                 for (const a of anchors) {
                                     const h = a.href || '';
-                                    if (POST_PATTERNS.some(p => h.includes(p))) { postUrl = h; break; }
+                                    if (VIDEO_PATTERNS.some(p => h.includes(p))) { postUrl = h; break; }
                                 }
-
-                                // Priority 2: video/reel/watch URLs
-                                if (!postUrl) {
-                                    for (const a of anchors) {
-                                        const h = a.href || '';
-                                        if (VIDEO_PATTERNS.some(p => h.includes(p))) { postUrl = h; break; }
+                            }
+                            // Priority 3: ลิ้งที่มีชื่อเพจ (fallback)
+                            if (!postUrl) {
+                                for (const a of anchors) {
+                                    const h = a.href || '';
+                                    if (h.length > 40 && h.toLowerCase().includes(pn)
+                                        && !h.includes('/photos/') && !h.endsWith('/' + pn)
+                                        && !h.endsWith('/' + pn + '/')) {
+                                        postUrl = h; break;
                                     }
                                 }
+                            }
 
-                                // Priority 3: ลิ้งที่มีชื่อเพจ (fallback)
-                                if (!postUrl) {
-                                    for (const a of anchors) {
-                                        const h = a.href || '';
-                                        if (h.length > 40 && h.toLowerCase().includes(pn)
-                                            && !h.includes('/photos/') && !h.endsWith('/' + pn)
-                                            && !h.endsWith('/' + pn + '/')) {
-                                            postUrl = h; break;
-                                        }
-                                    }
+                            // ─── Helper: clone art แล้วลบ nested articles/comments ออก ───
+                            // ใช้ clone เพื่อให้ innerText ไม่มี comment text ปนมา
+                            const nestedArts = Array.from(art.querySelectorAll("div[role='article']"));
+
+                            const isInComment = el => {
+                                for (const na of nestedArts) {
+                                    if (na.contains(el)) return true;
                                 }
-                            // ดึงข้อความจากโพสต์ — เฉพาะเนื้อหาโพสต์หลัก ไม่รวมคอมเมนต์
-                            // หา div ที่มีเนื้อหาโพสต์โดยตรง (ไม่ลงลึกถึงคอมเมนต์)
+                                return false;
+                            };
+
+                            // clone แล้วลบ nested articles + comment/reaction UI ออก
+                            const artClone = art.cloneNode(true);
+                            for (const na of artClone.querySelectorAll("div[role='article']")) {
+                                na.remove();
+                            }
+                            for (const el of artClone.querySelectorAll(
+                                '[aria-label*="omment"], [aria-label*="eaction"]'
+                            )) { el.remove(); }
+
                             let postText = '';
 
-                            // Priority 1: หาจาก element ที่เป็นข้อความหลักของโพสต์
+                            // Priority 1: selector เฉพาะของ Facebook สำหรับข้อความโพสต์
                             const msgSelectors = [
                                 '[data-ad-comet-preview="message"]',
                                 '[data-testid="post_message"]',
                                 '[data-ad-preview="message"]',
-                                'div[dir="auto"]:not([class*="comment"])',
-                                'span[dir="auto"]:not([class*="comment"])'
                             ];
-
                             for (const selector of msgSelectors) {
-                                // ใช้ querySelector แทน querySelectorAll เพื่อเอาแค่ element แรกที่เป็นข้อความหลัก
-                                const el = art.querySelector(selector);
+                                const el = artClone.querySelector(selector);
                                 if (el) {
                                     const text = (el.innerText || '').trim();
-                                    if (text.length > 3) {
-                                        postText = text;
-                                        break;
-                                    }
+                                    if (text.length > 0) { postText = text; break; }
                                 }
                             }
 
-                            // Fallback: ถ้ายังไม่เจอ ให้หาจาก div[dir="auto"] ตัวแรกที่ไม่อยู่ในคอมเมนต์
+                            // Priority 2: div/span[dir="auto"] จาก clone (ไม่มี nested articles แล้ว)
                             if (!postText) {
-                                const allTextDivs = art.querySelectorAll('div[dir="auto"], span[dir="auto"]');
-                                for (const div of allTextDivs) {
-                                    // ข้าม element ที่อยู่ในส่วนคอมเมนต์
-                                    if (div.closest('[data-ad-comet-preview="feedback"], [data-testid="comment_social_context"]')) {
-                                        continue;
-                                    }
-                                    const text = (div.innerText || '').trim();
-                                    if (text.length > 3) {
-                                        postText = text;
-                                        break;
+                                const textEls = artClone.querySelectorAll('div[dir="auto"], span[dir="auto"]');
+                                const seen = new Set();
+                                const lines = [];
+                                for (const el of textEls) {
+                                    const t = (el.innerText || '').trim();
+                                    if (t.length > 0 && !seen.has(t)) {
+                                        seen.add(t);
+                                        lines.push(t);
                                     }
                                 }
+                                postText = lines.join('\\n').trim();
                             }
 
-                            // Fallback สุดท้าย — ใช้ innerText ของ article แต่ตัดบรรทัดแรกๆ
+                            // Priority 3: innerText ของ clone (fallback สุดท้าย)
                             if (!postText) {
-                                const fullText = (art.innerText || '').trim();
-                                const lines = fullText.split('\\n');
-                                for (const line of lines) {
-                                    const trimmed = line.trim();
-                                    if (trimmed.length > 3 && !/^(เมื่อ|เพิ่ง|yesterday|just now|\\d+.*[นาทีชั่วโมงวัน])/.test(trimmed.toLowerCase())) {
-                                        postText = trimmed;
-                                        break;
-                                    }
+                                postText = (artClone.innerText || '').trim();
+                            }
+
+                            // ─── allText: ดึงจาก original art แต่กรอง nested articles ───
+                            const allTextLines = [];
+                            const allSeen = new Set();
+                            for (const el of art.querySelectorAll('div[dir="auto"], span[dir="auto"]')) {
+                                if (isInComment(el)) continue;
+                                const t = (el.innerText || '').trim();
+                                if (t.length > 0 && !allSeen.has(t)) {
+                                    allSeen.add(t);
+                                    allTextLines.push(t);
                                 }
                             }
+                            const allText = allTextLines.join('\\n');
+
+                            // ─── ดึงรูปภาพ ───
                             let imageUrl = '';
                             for (const img of art.querySelectorAll('img[src*="scontent"]')) {
+                                if (isInComment(img)) continue;
                                 const src = img.src || '';
                                 if (!src || src.includes('emoji')) continue;
                                 const w = parseInt(img.getAttribute('width') || '0');
                                 if (w && w <= 100) continue;
                                 imageUrl = src; break;
                             }
+
+                            // ─── Timestamp ───
                             const rawText = (art.innerText || '').split('\\n').slice(0, 10).join('\\n');
-                            // ดึง Unix timestamp จาก data-utime (วิธีที่แม่นที่สุด)
                             let utime = 0;
                             const abbrEl = art.querySelector('abbr[data-utime]');
                             if (abbrEl) {
                                 utime = parseInt(abbrEl.getAttribute('data-utime') || '0');
                             }
-                            // fallback: หา timestamp จาก aria-label ของลิงก์เวลา
                             let timeLabel = '';
                             if (!utime) {
                                 const timeLinks = art.querySelectorAll('a[role="link"] > span, a[href*="/posts/"] > span');
                                 for (const sp of timeLinks) {
+                                    if (isInComment(sp)) continue;
                                     const lbl = sp.getAttribute('aria-label') || sp.title || '';
                                     if (lbl && /\\d/.test(lbl)) { timeLabel = lbl; break; }
                                 }
                             }
 
-                            // ดึงข้อความทั้งหมดจากโพสต์เพื่อใช้ตรวจสอบ keyword (แม้จะเป็นโพสต์สั้น)
-                            const allText = Array.from(art.querySelectorAll('div[dir="auto"], span[dir="auto"]'))
-                                .map(el => (el.innerText || '').trim())
-                                .filter(t => t.length > 0)
-                                .join('\\n');
-
-                            return { postUrl, postText, imageUrl, rawText: rawText || allText, utime, timeLabel };
+                            return { postUrl, postText, imageUrl, rawText, allText, utime, timeLabel };
                         });
                     """, page_name)
                 except Exception as e:
@@ -1087,8 +1122,15 @@ class FacebookScraper:
 
                     try:
                         post_url = data.get("postUrl", "")
+
+                        # โพสต์ที่ไม่มี URL (text-only / shared text)
+                        # สร้าง synthetic URL จาก hash ของ text เพื่อใช้เป็น ID
+                        _raw_text_for_id = (data.get("postText") or data.get("allText") or data.get("rawText") or "").strip()
                         if not post_url:
-                            continue
+                            if not _raw_text_for_id:
+                                continue  # ไม่มีทั้ง URL และ text — ข้ามได้เลย
+                            _text_hash = hashlib.md5(_raw_text_for_id.encode("utf-8")).hexdigest()[:16]
+                            post_url = f"text_post://{page_name}/{_text_hash}"
 
                         post_url_clean = post_url.split("?")[0].rstrip("/")
 
@@ -1099,7 +1141,9 @@ class FacebookScraper:
 
                         post_id = self._extract_post_id(post_url_clean)
                         if not post_id:
-                            continue
+                            # fallback: ใช้ hash ของ URL เป็น post_id
+                            post_id = hashlib.md5(post_url_clean.encode("utf-8")).hexdigest()[:16]
+
                         if self.db.is_seen(post_id) or self.db.is_seen_by_url(post_url_clean):
                             continue
 
@@ -1128,40 +1172,30 @@ class FacebookScraper:
                                 consecutive_old = 0
                                 self.log(f"✅ โพสต์ใหม่ | เวลา: {post_time.strftime('%d/%m/%Y %H:%M')}")
                         else:
-                            # อ่านเวลาไม่ออกเลย → ข้ามโพสต์ เพื่อป้องกันดึงของเก่า
                             self.log("⏩ ข้ามโพสต์ (อ่านเวลาไม่ออก — ป้องกันโพสต์เก่าหลุด)")
                             continue
 
-                        post_text = data.get("postText", "")
-                        if not post_text:
-                            # fallback ใช้ rawText แทน
-                            post_text = data.get("rawText", "").strip()
+                        # ─── รวบรวม text สำหรับตรวจ keyword ───────────────
+                        post_text  = data.get("postText", "").strip()
+                        all_text   = data.get("allText", "").strip()
+                        raw_text   = data.get("rawText", "").strip()
 
-                        # ตัดข้อความเวลาและ metadata ออกจากต้นโพสต์
-                        if post_text:
-                            lines = post_text.split("\n")
-                            for i, line in enumerate(lines):
-                                trimmed = line.strip()
-                                # ข้ามบรรทัดที่เป็นเวลา/วันที่/ชื่อเพจ
-                                if trimmed and len(trimmed) > 2:
-                                    lower = trimmed.lower()
-                                    if not ("เมื่อ" in lower or "เพิ่ง" in lower or "yesterday" in lower or
-                                            "just now" in lower or re.match(r"^\d+.*[นาทีชั่วโมงวันสัปดาห์เดือนปี]", lower) or
-                                            re.match(r"^\d+.*min|hr|day|week|month|year", lower)):
-                                        post_text = "\n".join(lines[i:]).strip()
-                                        break
+                        # ใช้ allText/rawText เป็น fallback สำหรับโพสต์สั้น/โพสต์รูป
+                        if not post_text:
+                            post_text = all_text or raw_text
 
                         image_url = data.get("imageUrl") or None
 
-                        # 1. กรอง Keyword — ตรวจสอบทั้ง post_text และ rawText เพื่อไม่พลาดโพสต์สั้น
+                        # ─── ตรวจ keyword ───────────────────────────────────
+                        # ตรวจจาก postText + allText + rawText
+                        # รองรับโพสต์ทุกขนาด รวมโพสต์สั้นหรือโพสต์รูป
                         found_keywords = []
                         if keywords:
                             texts_to_check = []
-                            if post_text:
-                                texts_to_check.append(post_text.lower())
-                            raw = data.get("rawText", "").lower()
-                            if raw:
-                                texts_to_check.append(raw)
+                            for src in (post_text, all_text, raw_text):
+                                lowered = src.lower() if src else ""
+                                if lowered and lowered not in texts_to_check:
+                                    texts_to_check.append(lowered)
 
                             for kw in keywords:
                                 kw_lower = kw.lower().strip()
@@ -1174,15 +1208,22 @@ class FacebookScraper:
                             if not found_keywords:
                                 continue
 
-                        # ใช้ rawText แทนถ้า post_text ว่างหรือสั้นเกินไป
-                        if not post_text or len(post_text.strip()) < 3:
-                            raw_full = data.get("rawText", "").strip()
-                            if raw_full:
-                                post_text = raw_full
+                        # ตัดข้อความเวลาออกจากต้นโพสต์
+                        if post_text:
+                            lines = post_text.split("\n")
+                            for i, line in enumerate(lines):
+                                trimmed = line.strip()
+                                if trimmed and len(trimmed) > 2:
+                                    lower = trimmed.lower()
+                                    if not ("เมื่อ" in lower or "เพิ่ง" in lower or "yesterday" in lower or
+                                            "just now" in lower or re.match(r"^\d+.*[นาทีชั่วโมงวันสัปดาห์เดือนปี]", lower) or
+                                            re.match(r"^\d+.*min|hr|day|week|month|year", lower)):
+                                        post_text = "\n".join(lines[i:]).strip()
+                                        break
 
                         self.log(f"✅ พบ keyword: {found_keywords} | {post_url_clean[:70]}...")
 
-                        # 2. AI วิเคราะห์ (ถ้ามี)
+                        # ─── AI วิเคราะห์ ────────────────────────────────────
                         ai_result = None
                         if self.ai_analyzer and post_text:
                             ai_result = self.ai_analyzer.analyze(post_text)
@@ -1199,7 +1240,7 @@ class FacebookScraper:
                                     )
                                     self.log("💾 บันทึกลง Google Sheets เรียบร้อย")
 
-                        # 3. ส่ง Notification (ใช้เนื้อหาโพสต์)
+                        # ─── ส่ง Notification ─────────────────────────────────
                         self.discord.send_post(page_name, page_url, post_url_clean, post_text,
                                                found_keywords, image_url, ai_result=ai_result)
                         self.tg.send_post(page_name, page_url, post_url_clean, post_text,
@@ -1212,7 +1253,6 @@ class FacebookScraper:
                     except StaleElementReferenceException:
                         continue
                     except OSError as e:
-                        # SSL / certifi path error — patch แล้วข้ามโพสต์นี้ (ไม่ crash thread)
                         if "cacert.pem" in str(e) or "certificate" in str(e).lower():
                             try:
                                 import certifi as _certifi
@@ -1229,7 +1269,7 @@ class FacebookScraper:
                         self.log(f"⚠️ ข้ามโพสต์ที่อ่านไม่ได้: {type(e).__name__}: {e}")
                         continue
 
-                # ── ตรวจ URL ใหม่ต่อรอบ (แก้ dead-code เดิม) ───────────────────
+                # ตรวจ URL ใหม่ต่อรอบ
                 if new_in_this_round:
                     rounds_without_new_urls = 0
                 else:
@@ -1246,7 +1286,6 @@ class FacebookScraper:
                         break
 
         except InvalidSessionIdException as e:
-            # Session หมดอายุ (browser crash กลางคัน) — re-raise ให้ run() รับรู้และเปิด browser ใหม่
             self.log(f"❌ Browser session หมดอายุระหว่างสแกน {page_name} — จะเปิด Browser ใหม่รอบหน้า")
             raise
         except WebDriverException as e:
@@ -1268,8 +1307,8 @@ class FacebookScraper:
         hours_back: int,
         loop_minutes: int,
     ):
-        MAX_CONSECUTIVE_FAILURES = 5   # หยุดถ้าล้มเหลวติดต่อกันเกิน N รอบ
-        RETRY_WAIT_SECONDS       = 300 # รอ 5 นาทีก่อน retry เมื่อ cycle ล้มเหลว
+        MAX_CONSECUTIVE_FAILURES = 5
+        RETRY_WAIT_SECONDS       = 300
 
         _started_successfully = False
         _session_start = time.time()
@@ -1281,12 +1320,8 @@ class FacebookScraper:
             self.tg.send_start(len(page_urls), len(keywords), loop_minutes, hours_back)
             _started_successfully = True
 
-            # ════════════════════════════════════════════════════════════
-            # Main loop — แต่ละรอบ wrap ด้วย try/except เพื่อ retry
-            # ════════════════════════════════════════════════════════════
             while not self._stop_event.is_set():
 
-                # ── ล้าง DB เก่าทุกเช้า 09:00 ─────────────────────────
                 now = datetime.now()
                 if now.hour >= 9 and last_cleanup_date != now.date():
                     self.log("🧹 ถึงเวลา 09:00 น. | เริ่มล้างข้อมูล Database เก่า...")
@@ -1301,20 +1336,16 @@ class FacebookScraper:
 
                 cycle_ok = False
                 try:
-                    # ── เปิด Browser ──────────────────────────────────
                     self._start_browser()
 
-                    # ── Login / Load cookies ───────────────────────────
                     if not self._load_cookies():
                         self.log("🔑 ไม่มี Session เดิม — เริ่มล็อกอินใหม่")
                         if not self.login(email, password):
                             raise RuntimeError("Login ล้มเหลว — cookies หมดอายุหรือ password ผิด")
 
-                    # ── ซ่อน Browser ─────────────────────────────────
                     time.sleep(1)
                     self.hide_browser()
 
-                    # ── สแกนทุกเพจ ────────────────────────────────────
                     total_new = 0
                     for url in page_urls:
                         if self._stop_event.is_set():
@@ -1337,7 +1368,7 @@ class FacebookScraper:
                     self.discord.send_cycle_complete(duration, loop_minutes, total_new, len(page_urls))
                     self.tg.send_cycle_complete(duration, loop_minutes, total_new, len(page_urls))
 
-                    self._consecutive_failures = 0   # reset เมื่อสำเร็จ
+                    self._consecutive_failures = 0
                     cycle_ok = True
 
                 except Exception as e:
@@ -1348,26 +1379,18 @@ class FacebookScraper:
                         f"{type(e).__name__}: {e}"
                     )
                     if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                        self.log(
-                            f"🔴 ล้มเหลวติดต่อกัน {MAX_CONSECUTIVE_FAILURES} รอบ — หยุดทำงาน"
-                        )
-                        self.discord.send_obstacle(
-                            f"FATAL: ล้มเหลว {MAX_CONSECUTIVE_FAILURES} รอบติด", ""
-                        )
-                        self.tg.send_obstacle(
-                            f"FATAL: ล้มเหลว {MAX_CONSECUTIVE_FAILURES} รอบติด", ""
-                        )
+                        self.log(f"🔴 ล้มเหลวติดต่อกัน {MAX_CONSECUTIVE_FAILURES} รอบ — หยุดทำงาน")
+                        self.discord.send_obstacle(f"FATAL: ล้มเหลว {MAX_CONSECUTIVE_FAILURES} รอบติด", "")
+                        self.tg.send_obstacle(f"FATAL: ล้มเหลว {MAX_CONSECUTIVE_FAILURES} รอบติด", "")
                         break
 
                 finally:
-                    # ── ปิด Browser ทุกกรณี — ปลอดภัยสมบูรณ์ ─────────
                     self.log("🛑 ปิด Browser ชั่วคราว...")
                     self._safe_quit_driver()
 
                 if self._stop_event.is_set():
                     break
 
-                # ── นับถอยหลังก่อนรอบถัดไป ────────────────────────────
                 if cycle_ok:
                     wait_secs = loop_minutes * 60
                     self.log(f"⏳ รอ {loop_minutes} นาทีก่อนรอบถัดไป...")
