@@ -20,8 +20,18 @@ from ai_analyzer import ClaudeAnalyzer
 from sheets_manager import GoogleSheetsManager
 from scraper import FacebookScraper
 from ui.widgets import KeywordTagInput
+import os
+import sys
 
+def resource_path(relative_path):
+    """ คืนค่า Path ที่ถูกต้องสำหรับทั้งตอนรันปกติ และตอนรันผ่าน .exe """
+    try:
+        # PyInstaller เก็บ Path โฟลเดอร์ชั่วคราวไว้ใน sys._MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
 
+    return os.path.join(base_path, relative_path)
 # ── Color tokens ─────────────────────────────────────────────────────────────
 C = {
     "bg":           "#0a0e1a",   # พื้นหลังหลัก
@@ -54,6 +64,7 @@ class ScraperApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("FB News Scraper")
+        self.iconbitmap(resource_path("app_icon.ico"))
         self.geometry("1440x880")
         self.minsize(1100, 660)
         self.resizable(True, True)
