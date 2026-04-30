@@ -12,7 +12,16 @@ import re
 import os
 import random
 import hashlib
+import sys
 from datetime import datetime, timedelta
+
+try:
+    import win32gui
+    import win32con
+    import win32ui
+    WIN32_AVAILABLE = True
+except ImportError:
+    WIN32_AVAILABLE = False
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -222,6 +231,62 @@ class FacebookScraper:
         except Exception as e:
             self.log(f"⚠️ show_browser: {e}")
 
+    def _set_chrome_icon(self):
+        """เปลี่ยนไอคอนหน้าต่าง Chrome เป็น app_icon.ico"""
+        if not WIN32_AVAILABLE:
+            self.log("⚠️ pywin32 ไม่ติดตั้ง — ข้ามการเปลี่ยนไอคอน (pip install pywin32)")
+            return
+        try:
+            # หา path ของ app_icon.ico — รองรับทั้ง run ปกติและ PyInstaller
+            if getattr(sys, 'frozen', False):
+                # รันผ่าน PyInstaller
+                icon_path = os.path.join(sys._MEIPASS, "app_icon.ico")
+            else:
+                # รันปกติ
+                icon_path = os.path.join(os.path.dirname(__file__), "app_icon.ico")
+
+            if not os.path.exists(icon_path):
+                self.log(f"⚠️ ไม่พบไฟล์ {icon_path}")
+                return
+
+            # โหลดไอคอน
+            hicon = win32gui.LoadImage(
+                None, icon_path, win32con.IMAGE_ICON,
+                32, 32, win32con.LR_LOADFROMFILE
+            )
+
+            # หา HWND ของ Chrome window — รอให้ window พร้อม
+            max_retries = 5
+            hwnds = []
+            for retry in range(max_retries):
+                hwnds = self._find_browser_hwnds()
+                if hwnds:
+                    break
+                time.sleep(0.3)
+
+            if not hwnds:
+                self.log("⚠️ ไม่พบ Chrome window handles")
+                return
+
+            # ตั้งไอคอนให้ทุก window
+            set_count = 0
+            for hwnd in hwnds:
+                try:
+                    # ตรวจสอบว่า window พร้อมหรือยัง
+                    if win32gui.IsWindowVisible(hwnd):
+                        win32gui.SendMessage(hwnd, win32con.WM_SETICON, win32con.ICON_BIG, hicon)
+                        win32gui.SendMessage(hwnd, win32con.WM_SETICON, win32con.ICON_SMALL, hicon)
+                        set_count += 1
+                except Exception:
+                    pass
+
+            if set_count > 0:
+                self.log(f"🎨 เปลี่ยนไอคอน Browser แล้ว ({set_count} หน้าต่าง)")
+            else:
+                self.log("⚠️ ไม่สามารถเปลี่ยนไอคอน — window ยังไม่พร้อม")
+        except Exception as e:
+            self.log(f"⚠️ _set_chrome_icon: {e}")
+
     def _safe_quit_driver(self):
         """ปิด Browser อย่างปลอดภัย — ไม่ throw exception ไม่ว่ากรณีใด"""
         drv = self.driver
@@ -337,6 +402,8 @@ class FacebookScraper:
                 self.driver = uc.Chrome(options=_make_options(), use_subprocess=True, **kwargs)
                 self.driver.set_page_load_timeout(60)
                 self.log("🌐 เปิด Browser สำเร็จ")
+                time.sleep(0.5)  # รอให้ window พร้อมก่อนเปลี่ยนไอคอน
+                self._set_chrome_icon()    # เปลี่ยนไอคอนเป็น app_icon.ico
                 return                     # ออกทันทีเมื่อสำเร็จ
             except Exception as e:
                 last_err = e
@@ -613,6 +680,8 @@ class FacebookScraper:
             r"/reel/(\d+)",          # Facebook Reels
             r"[?&]v=(\d+)",          # /watch/?v=VIDEO_ID
             r"/watch/\?v=(\d+)",     # explicit watch URL
+            r"/share/p/([^/]+)",     # New share post format: /share/p/17YTnRYsZA/
+            r"/share/([^/]+)",       # Alternate share format
         ]
         for pattern in patterns:
             m = re.search(pattern, url)
@@ -756,8 +825,53 @@ class FacebookScraper:
         return None
 
     def _get_articles(self) -> list:
+        """ดึงเฉพาะโพสต์หลัก — ไม่รวมคอมเมนต์ รองรับทั้ง Page และ Profile"""
         try:
-            return self.driver.find_elements(By.XPATH, "//div[@role='article']")
+            # ใช้ selector ที่เจาะจงมากขึ้น เพื่อไม่ดึงคอมเมนต์
+            # div[role='article'] ที่มี data-ad-comet-preview=feedback คือคอมเมนต์
+            # เพิ่ม selector สำหรับ Facebook Profile (ใช้ xstyle div แทน)
+            articles = []
+
+            # Selector 1: หน้า Page ปกติ
+            articles_page = self.driver.find_elements(
+                By.XPATH,
+                "//div[@role='article' and not(@data-ad-comet-preview='feedback') "
+                "and not(ancestor::div[@data-ad-comet-preview='feedback'])]"
+            )
+            articles.extend(articles_page)
+
+            # Selector 2: หน้า Profile (ใช้ div[class*="feed"] หรือ div[data-visualcompletion="css"])
+            if not articles:
+                articles_profile = self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "div[xstyle*='feed'], div[data-visualcompletion='css'], div[aria-posinset]"
+                )
+                # กรองเฉพาะ element ที่เป็นโพสต์ (มีเนื้อหาหรือมีเวลา)
+                for el in articles_profile:
+                    try:
+                        text = el.get_attribute("innerText") or ""
+                        if text and len(text) > 10:
+                            # ข้ามคอมเมนต์
+                            if "data-ad-comet-preview='feedback'" not in el.get_attribute("outerHTML") or "":
+                                articles.append(el)
+                    except Exception:
+                        continue
+
+            # Selector 3: fallback — หาทุก div ที่มี data-ft (metadata ของ Facebook post)
+            if not articles:
+                articles_fallback = self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "div[data-ft]"
+                )
+                for el in articles_fallback:
+                    try:
+                        text = el.get_attribute("innerText") or ""
+                        if text and len(text) > 20:
+                            articles.append(el)
+                    except Exception:
+                        continue
+
+            return articles
         except Exception as e:
             self.log(f"⚠️ _get_articles error: {e}")
             return []
@@ -841,7 +955,7 @@ class FacebookScraper:
                 try:
                     article_data: list = self.driver.execute_script("""
                         const pn = arguments[0].toLowerCase();
-                        const POST_PATTERNS  = ['/posts/', 'story_fbid', '/permalink/', 'fbid='];
+                        const POST_PATTERNS  = ['/posts/', 'story_fbid', '/permalink/', 'fbid=', '/share/p/', '/share/'];
                             const VIDEO_PATTERNS = ['/videos/', '/reel/', '/watch/', '?v=', '%3Fv%3D'];
                             const ALL_PATTERNS   = [...POST_PATTERNS, ...VIDEO_PATTERNS];
                             return Array.from(document.querySelectorAll("div[role='article']")).map(art => {
@@ -873,28 +987,51 @@ class FacebookScraper:
                                         }
                                     }
                                 }
-                            // ดึงข้อความจากโพสต์ — รองรับทั้งโพสต์เล็กและใหญ่
-                            const msgEl = art.querySelector(
-                                '[data-ad-comet-preview="message"], [data-testid="post_message"], ' +
-                                '[data-ad-preview="message"], div[dir="auto"] > div[dir="auto"]'
-                            );
-                            let postText = msgEl ? (msgEl.innerText || '').trim() : '';
+                            // ดึงข้อความจากโพสต์ — เฉพาะเนื้อหาโพสต์หลัก ไม่รวมคอมเมนต์
+                            // หา div ที่มีเนื้อหาโพสต์โดยตรง (ไม่ลงลึกถึงคอมเมนต์)
+                            let postText = '';
 
-                            // ถ้าไม่เจอ ให้ลองหาจากทุก element ที่มี text
-                            if (!postText || postText.length < 5) {
-                                const allDirs = art.querySelectorAll('div[dir="auto"], span[dir="auto"], div[class*="text"]');
-                                for (const d of allDirs) {
-                                    const t = (d.innerText || '').trim();
-                                    // ลดเงื่อนไขจาก 20 ตัวอักษรเหลือ 5 ตัวอักษร เพื่อรองรับโพสต์สั้น
-                                    if (t.length > 5) { postText = t; break; }
+                            // Priority 1: หาจาก element ที่เป็นข้อความหลักของโพสต์
+                            const msgSelectors = [
+                                '[data-ad-comet-preview="message"]',
+                                '[data-testid="post_message"]',
+                                '[data-ad-preview="message"]',
+                                'div[dir="auto"]:not([class*="comment"])',
+                                'span[dir="auto"]:not([class*="comment"])'
+                            ];
+
+                            for (const selector of msgSelectors) {
+                                // ใช้ querySelector แทน querySelectorAll เพื่อเอาแค่ element แรกที่เป็นข้อความหลัก
+                                const el = art.querySelector(selector);
+                                if (el) {
+                                    const text = (el.innerText || '').trim();
+                                    if (text.length > 3) {
+                                        postText = text;
+                                        break;
+                                    }
                                 }
                             }
 
-                            // Fallback สุดท้าย — ใช้ innerText ทั้งหมด แต่ตัดบรรทัดแรกๆ ที่อาจเป็นชื่อเพจ
+                            // Fallback: ถ้ายังไม่เจอ ให้หาจาก div[dir="auto"] ตัวแรกที่ไม่อยู่ในคอมเมนต์
+                            if (!postText) {
+                                const allTextDivs = art.querySelectorAll('div[dir="auto"], span[dir="auto"]');
+                                for (const div of allTextDivs) {
+                                    // ข้าม element ที่อยู่ในส่วนคอมเมนต์
+                                    if (div.closest('[data-ad-comet-preview="feedback"], [data-testid="comment_social_context"]')) {
+                                        continue;
+                                    }
+                                    const text = (div.innerText || '').trim();
+                                    if (text.length > 3) {
+                                        postText = text;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // Fallback สุดท้าย — ใช้ innerText ของ article แต่ตัดบรรทัดแรกๆ
                             if (!postText) {
                                 const fullText = (art.innerText || '').trim();
                                 const lines = fullText.split('\\n');
-                                // หาบรรทัดที่มีเนื้อหาจริง (ไม่ใช่ชื่อเพจหรือปุ่ม)
                                 for (const line of lines) {
                                     const trimmed = line.trim();
                                     if (trimmed.length > 3 && !/^(เมื่อ|เพิ่ง|yesterday|just now|\\d+.*[นาทีชั่วโมงวัน])/.test(trimmed.toLowerCase())) {
@@ -1014,17 +1151,14 @@ class FacebookScraper:
                                         post_text = "\n".join(lines[i:]).strip()
                                         break
 
-                        # ไม่ข้ามโพสต์สั้นอีกต่อไป — แค่มีคีย์เวิร์ดก็พอ
-                        if not post_text or len(post_text.strip()) < 2:
-                            continue
-
                         image_url = data.get("imageUrl") or None
 
                         # 1. กรอง Keyword — ตรวจสอบทั้ง post_text และ rawText เพื่อไม่พลาดโพสต์สั้น
                         found_keywords = []
                         if keywords:
-                            # ตรวจสอบจากทั้ง post_text และ rawText (สำหรับโพสต์ที่ข้อความอาจอยู่ใน rawText)
-                            texts_to_check = [post_text.lower()]
+                            texts_to_check = []
+                            if post_text:
+                                texts_to_check.append(post_text.lower())
                             raw = data.get("rawText", "").lower()
                             if raw:
                                 texts_to_check.append(raw)
@@ -1040,35 +1174,32 @@ class FacebookScraper:
                             if not found_keywords:
                                 continue
 
-                        self.log(f"🔎 พบเงื่อนไขเบื้องต้น ส่งให้ AI วิเคราะห์: {post_url_clean[:50]}...")
+                        # ใช้ rawText แทนถ้า post_text ว่างหรือสั้นเกินไป
+                        if not post_text or len(post_text.strip()) < 3:
+                            raw_full = data.get("rawText", "").strip()
+                            if raw_full:
+                                post_text = raw_full
 
-                        # 2. AI วิเคราะห์
+                        self.log(f"✅ พบ keyword: {found_keywords} | {post_url_clean[:70]}...")
+
+                        # 2. AI วิเคราะห์ (ถ้ามี)
                         ai_result = None
-                        if self.ai_analyzer:
+                        if self.ai_analyzer and post_text:
                             ai_result = self.ai_analyzer.analyze(post_text)
-
-                        if ai_result:
-                            is_target = ai_result.get("is_target", False)
-                            score     = ai_result.get("score", 0)
-                            if is_target and score >= 6:
-                                self.log(f"🎯 [AI PASS] คะแนน: {score}/10 | เหตุผล: {ai_result.get('reason')}")
+                            if ai_result and ai_result.get("is_target") and ai_result.get("score", 0) >= 6:
+                                self.log(f"🎯 [AI PASS] คะแนน: {ai_result.get('score')}/10")
                                 if self.sheets_manager:
                                     self.sheets_manager.upload_news(
                                         page_name=page_name,
                                         post_url=post_url_clean,
                                         post_text=post_text,
                                         persons=ai_result.get("persons", []),
-                                        score=score,
+                                        score=ai_result.get("score", 0),
                                         reason=ai_result.get("reason", "")
                                     )
                                     self.log("💾 บันทึกลง Google Sheets เรียบร้อย")
-                            else:
-                                self.log(f"⏩ [AI REJECT] AI มองว่าไม่เกี่ยวข้อง (Score: {score})")
-                                continue
-                        else:
-                            self.log(f"✅ โพสต์ตรงเงื่อนไข Keyword: {post_url_clean[:70]}")
 
-                        # 3. ส่ง Notification
+                        # 3. ส่ง Notification (ใช้เนื้อหาโพสต์)
                         self.discord.send_post(page_name, page_url, post_url_clean, post_text,
                                                found_keywords, image_url, ai_result=ai_result)
                         self.tg.send_post(page_name, page_url, post_url_clean, post_text,
