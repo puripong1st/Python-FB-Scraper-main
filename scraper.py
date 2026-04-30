@@ -873,19 +873,36 @@ class FacebookScraper:
                                         }
                                     }
                                 }
+                            // ดึงข้อความจากโพสต์ — รองรับทั้งโพสต์เล็กและใหญ่
                             const msgEl = art.querySelector(
                                 '[data-ad-comet-preview="message"], [data-testid="post_message"], ' +
                                 '[data-ad-preview="message"], div[dir="auto"] > div[dir="auto"]'
                             );
                             let postText = msgEl ? (msgEl.innerText || '').trim() : '';
-                            if (!postText) {
-                                const allDirs = art.querySelectorAll('div[dir="auto"]');
+
+                            // ถ้าไม่เจอ ให้ลองหาจากทุก element ที่มี text
+                            if (!postText || postText.length < 5) {
+                                const allDirs = art.querySelectorAll('div[dir="auto"], span[dir="auto"], div[class*="text"]');
                                 for (const d of allDirs) {
                                     const t = (d.innerText || '').trim();
-                                    if (t.length > 20) { postText = t; break; }
+                                    // ลดเงื่อนไขจาก 20 ตัวอักษรเหลือ 5 ตัวอักษร เพื่อรองรับโพสต์สั้น
+                                    if (t.length > 5) { postText = t; break; }
                                 }
                             }
-                            if (!postText) postText = (art.innerText || '').trim().split('\\n').slice(0, 30).join('\\n');
+
+                            // Fallback สุดท้าย — ใช้ innerText ทั้งหมด แต่ตัดบรรทัดแรกๆ ที่อาจเป็นชื่อเพจ
+                            if (!postText) {
+                                const fullText = (art.innerText || '').trim();
+                                const lines = fullText.split('\\n');
+                                // หาบรรทัดที่มีเนื้อหาจริง (ไม่ใช่ชื่อเพจหรือปุ่ม)
+                                for (const line of lines) {
+                                    const trimmed = line.trim();
+                                    if (trimmed.length > 3 && !/^(เมื่อ|เพิ่ง|yesterday|just now|\\d+.*[นาทีชั่วโมงวัน])/.test(trimmed.toLowerCase())) {
+                                        postText = trimmed;
+                                        break;
+                                    }
+                                }
+                            }
                             let imageUrl = '';
                             for (const img of art.querySelectorAll('img[src*="scontent"]')) {
                                 const src = img.src || '';
@@ -910,7 +927,14 @@ class FacebookScraper:
                                     if (lbl && /\\d/.test(lbl)) { timeLabel = lbl; break; }
                                 }
                             }
-                            return { postUrl, postText, imageUrl, rawText, utime, timeLabel };
+
+                            // ดึงข้อความทั้งหมดจากโพสต์เพื่อใช้ตรวจสอบ keyword (แม้จะเป็นโพสต์สั้น)
+                            const allText = Array.from(art.querySelectorAll('div[dir="auto"], span[dir="auto"]'))
+                                .map(el => (el.innerText || '').trim())
+                                .filter(t => t.length > 0)
+                                .join('\\n');
+
+                            return { postUrl, postText, imageUrl, rawText: rawText || allText, utime, timeLabel };
                         });
                     """, page_name)
                 except Exception as e:
@@ -975,17 +999,44 @@ class FacebookScraper:
                         if not post_text:
                             # fallback ใช้ rawText แทน
                             post_text = data.get("rawText", "").strip()
-                        if not post_text:
+
+                        # ตัดข้อความเวลาและ metadata ออกจากต้นโพสต์
+                        if post_text:
+                            lines = post_text.split("\n")
+                            for i, line in enumerate(lines):
+                                trimmed = line.strip()
+                                # ข้ามบรรทัดที่เป็นเวลา/วันที่/ชื่อเพจ
+                                if trimmed and len(trimmed) > 2:
+                                    lower = trimmed.lower()
+                                    if not ("เมื่อ" in lower or "เพิ่ง" in lower or "yesterday" in lower or
+                                            "just now" in lower or re.match(r"^\d+.*[นาทีชั่วโมงวันสัปดาห์เดือนปี]", lower) or
+                                            re.match(r"^\d+.*min|hr|day|week|month|year", lower)):
+                                        post_text = "\n".join(lines[i:]).strip()
+                                        break
+
+                        # ไม่ข้ามโพสต์สั้นอีกต่อไป — แค่มีคีย์เวิร์ดก็พอ
+                        if not post_text or len(post_text.strip()) < 2:
                             continue
 
                         image_url = data.get("imageUrl") or None
 
-                        # 1. กรอง Keyword
+                        # 1. กรอง Keyword — ตรวจสอบทั้ง post_text และ rawText เพื่อไม่พลาดโพสต์สั้น
                         found_keywords = []
                         if keywords:
+                            # ตรวจสอบจากทั้ง post_text และ rawText (สำหรับโพสต์ที่ข้อความอาจอยู่ใน rawText)
+                            texts_to_check = [post_text.lower()]
+                            raw = data.get("rawText", "").lower()
+                            if raw:
+                                texts_to_check.append(raw)
+
                             for kw in keywords:
-                                if kw.lower().strip() in post_text.lower():
-                                    found_keywords.append(kw.strip())
+                                kw_lower = kw.lower().strip()
+                                for text in texts_to_check:
+                                    if kw_lower in text:
+                                        if kw not in found_keywords:
+                                            found_keywords.append(kw)
+                                        break
+
                             if not found_keywords:
                                 continue
 
