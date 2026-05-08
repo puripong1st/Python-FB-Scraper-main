@@ -3,14 +3,12 @@ scraper.py — FacebookScraper  (Final Clean Version)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ฟีเจอร์ครบ / ไร้บัค:
   ✅ _is_logged_in()  — ตรวจ DOM จริง ไม่ใช่แค่ URL
-     (แก้บัค: cookie หมดอายุแล้วไม่แจ้งเตือน เพราะ FB redirect กลับ
-      facebook.com/ ซึ่ง URL ไม่มีคำว่า "login")
   ✅ cookie expired   — แจ้งเตือน Discord + Telegram + หยุดรอ Resume
-  ✅ FB อินเดีย       — data-pagelet="FeedUnit_N" กรอง comment ออก 100%
+  ✅ FB อินเดีย       — THE NUKE STRATEGY กรองคอมเมนต์ออก 100% เด็ดขาด
   ✅ URL format ใหม่  — pfbid, story.php, photo.php, web.facebook.com
   ✅ Timestamp        — รองรับทั้งไทย + English
   ✅ ปุ่มซ่อน Browser — sync กับ state จริงผ่าน callback (thread-safe)
-  ✅ Obstacle         — Checkpoint / 2FA / CAPTCHA / Identity Verify
+  ✅ Obstacle         — Checkpoint / 2FA / CAPTCHA (รองรับการหยุดรอให้กรอก 2FA)
 """
 
 import threading
@@ -162,23 +160,19 @@ class FacebookScraper:
             EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
 
             def _cb(hwnd, _):
-                # 1. เช็ค Class Name ของ Chrome
                 cls = ctypes.create_unicode_buffer(64)
                 ctypes.windll.user32.GetClassNameW(hwnd, cls, 64)
                 if cls.value not in ("Chrome_WidgetWin_1", "Chrome_WidgetWin_0"):
                     return True
                 
-                # 2. เช็ค PID ว่าตรงกับบอทของเราไหม
                 win_pid = ctypes.c_ulong(0)
                 ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(win_pid))
                 if pids and win_pid.value not in pids:
                     return True
                 
-                # 🔴 ส่วนที่เพิ่มใหม่: กรองหน้าต่างระบบของ Chrome ทิ้ง
-                # เช็คความยาวของชื่อหน้าต่าง (Title) หน้าต่างหลักของเว็บจะต้องมีชื่อเสมอ
                 title_length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
                 if title_length == 0:
-                    return True # ถ้าไม่มีชื่อ (หน้าต่างดำ/ระบบ) ให้ข้ามไป ไม่ต้องเก็บเข้า list
+                    return True
 
                 found.append(hwnd)
                 return True
@@ -207,27 +201,21 @@ class FacebookScraper:
         except Exception as e:
             self.log(f"⚠️ hide_browser: {e}")
             
-        # แจ้ง UI ให้ sync ปุ่มเสมอ (แม้ ctypes จะล้มเหลว ก็ยังต้อง sync state)
-        # 🛠️ เช็คความปลอดภัยก่อนเรียกใช้ฟังก์ชัน
         if hasattr(self, '_on_browser_hidden') and callable(self._on_browser_hidden):
             try:
                 self._on_browser_hidden()
             except Exception as e:
-                # 🔴 เปลี่ยนจาก pass เป็นพิมพ์ Error ออกมาดู
                 self.log(f"⚠️ โค้ดพังที่ _on_browser_hidden: {e}")
-                print(f"Error details: {e}")
 
     def show_browser(self):
         try:
             import ctypes
-            SW_SHOW = 5     # 5 = แสดงหน้าต่างที่ถูกซ่อน (SW_HIDE)
-            SW_RESTORE = 9  # 9 = คืนค่าจากที่ย่อไว้ (Minimized)
+            SW_SHOW = 5     
+            SW_RESTORE = 9  
             
             hwnds = self._find_browser_hwnds()
             shown = 0
             for hwnd in hwnds:
-                # แนะนำให้ใช้ SW_SHOW ด้วย เผื่อหน้าต่างถูกซ่อนแบบสมบูรณ์ (SW_HIDE) 
-                # ไม่ได้แค่ย่อลง Taskbar
                 ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
                 ctypes.windll.user32.ShowWindow(hwnd, SW_SHOW) 
                 ctypes.windll.user32.SetForegroundWindow(hwnd)
@@ -239,15 +227,11 @@ class FacebookScraper:
         except Exception as e:
             self.log(f"⚠️ show_browser: {e}")
             
-        # แจ้ง UI ให้ sync ปุ่มเสมอ
-        # เช็คให้ชัวร์ว่ามีตัวแปรนี้อยู่จริง และสามารถเรียกใช้งาน (callable) ได้
         if hasattr(self, '_on_browser_shown') and callable(self._on_browser_shown):
             try:
                 self._on_browser_shown()
             except Exception as e:
-                # 🔴 เปลี่ยนจาก pass เป็นการ log จะได้รู้ว่าทำไม UI ไม่ยอมอัปเดต
                 self.log(f"⚠️ โค้ดพังที่ _on_browser_shown: {e}")
-                print(f"Error details: {e}")
 
     def _set_chrome_icon(self):
         try:
@@ -319,7 +303,6 @@ class FacebookScraper:
             o.page_load_strategy = "eager"
             return o
 
-        # ตรวจเวอร์ชัน Chrome จาก EXE
         chrome_version = None
         for cmd in [
             "(Get-Item (Get-Command chrome).Source).VersionInfo.ProductVersion",
@@ -361,7 +344,6 @@ class FacebookScraper:
                 self._safe_quit_driver()
                 time.sleep(1)
 
-                # snapshot PIDs ก่อน launch เพื่อ diff หา PIDs ของเรา
                 try:
                     import json as _j
                     r = subprocess.run(
@@ -398,22 +380,7 @@ class FacebookScraper:
     # ── Login detection ───────────────────────────────────────────────────────
 
     def _is_logged_in(self) -> bool:
-        """
-        ตรวจว่า login สำเร็จหรือไม่ โดยตรวจ DOM จริง ไม่ใช่แค่ URL
-
-        สาเหตุที่ต้องใช้วิธีนี้:
-          Facebook ที่ cookie หมดอายุมักจะ redirect กลับ facebook.com/
-          URL ไม่มีคำว่า "login" → การตรวจแค่ URL บอกผิดพลาดว่า login สำเร็จ
-          → ทำให้ _handle_cookie_expired() ไม่ถูกเรียก → ไม่มีแจ้งเตือน
-
-        Logic:
-          1. URL มี /login / /checkpoint → False ทันที (ชัวร์ว่าไม่ได้ login)
-          2. DOM มี login form → False (ชัวร์)
-          3. DOM มี element ที่มีเฉพาะตอน login แล้ว → True (ชัวร์)
-          4. ไม่แน่ใจ → False (conservative — ดีกว่า assume True ผิด)
-        """
         try:
-            # รอให้หน้าโหลดสมบูรณ์ก่อน (สูงสุด 5 วิ)
             for _ in range(10):
                 try:
                     if self.driver.execute_script("return document.readyState;") == "complete":
@@ -424,12 +391,10 @@ class FacebookScraper:
 
             url = self.driver.current_url.lower()
 
-            # 1. URL บ่งชี้ว่าไม่ได้ login → False
             if any(x in url for x in ("login", "checkpoint", "two_step", "captcha", "disabled", "suspended")):
                 return False
 
             result = self.driver.execute_script("""
-                // ── Negative: มี login form = ยังไม่ login ─────────────────
                 const NOT_LOGGED = [
                     'form#login_form',
                     'input#email[type="text"]',
@@ -440,23 +405,21 @@ class FacebookScraper:
                 ];
                 if (NOT_LOGGED.some(s => document.querySelector(s))) return false;
 
-                // ── Positive: element ที่มีเฉพาะตอน login แล้ว ────────────
                 const LOGGED_IN = [
-                    'div[role="feed"]',                     // feed หลัก
-                    '[data-pagelet="FeedUnit_0"]',          // โพสต์แรกใน feed
-                    '[data-pagelet="ProfileTimeline"]',     // หน้า profile
-                    '[data-pagelet="PageTimeline"]',        // หน้า page
-                    '[aria-label="บัญชีของคุณ"]',           // menu ไทย
-                    '[aria-label="Your account"]',          // menu EN
+                    'div[role="feed"]',                     
+                    '[data-pagelet="FeedUnit_0"]',          
+                    '[data-pagelet="ProfileTimeline"]',     
+                    '[data-pagelet="PageTimeline"]',        
+                    '[aria-label="บัญชีของคุณ"]',           
+                    '[aria-label="Your account"]',          
                     '[aria-label="Account"]',
-                    '[aria-label="สร้างโพสต์"]',            // composer
+                    '[aria-label="สร้างโพสต์"]',            
                     '[aria-label="Create post"]',
-                    '[data-pagelet="LeftRail"]',            // left sidebar
-                    'div[data-pagelet="Stories"]',          // Stories bar
+                    '[data-pagelet="LeftRail"]',            
+                    'div[data-pagelet="Stories"]',          
                 ];
                 if (LOGGED_IN.some(s => document.querySelector(s))) return true;
 
-                // ── ไม่แน่ใจ → null → Python จะ treat เป็น False ─────────
                 return null;
             """)
 
@@ -465,8 +428,6 @@ class FacebookScraper:
             elif result is False:
                 return False
             else:
-                # null = ตรวจไม่ชัดเจน → conservative = False
-                # (ดีกว่า assume True แล้ว cookie expired ไม่แจ้งเตือน)
                 self.log("⚠️ _is_logged_in: ตรวจไม่ชัด → ถือว่ายังไม่ได้ login")
                 return False
 
@@ -492,10 +453,6 @@ class FacebookScraper:
             except Exception as e: self.log(f"⚠️ on_cookies_saved: {e}")
 
     def _load_cookies(self) -> bool:
-        """
-        โหลด Cookie และตรวจ session ด้วย _is_logged_in()
-        ไม่ใช่แค่ตรวจ URL — แก้บัคหลักที่ทำให้ไม่แจ้งเตือน cookie หมดอายุ
-        """
         if not os.path.exists(COOKIES_FILE):
             return False
         try:
@@ -573,36 +530,47 @@ class FacebookScraper:
                 self._handle_obstacle("Login Button Not Found", f"{self.HOME_URL}/login")
                 if self._stop_event.is_set(): return False
 
-            self.log("⏳ รอโหลดหลัง Login...")
+            self.log("⏳ รอระบบตรวจสอบล็อกอิน (6 วินาที)...")
             time.sleep(6)
 
-            ob = self._detect_obstacle()
-            if ob:
-                self._handle_obstacle(ob, f"{self.HOME_URL}/login")
+            # 🔴 ให้โอกาสตรวจเช็คอุปสรรค 2 รอบ ป้องกัน 2FA/Checkpoint โหลดหน้าช้า
+            for _ in range(2):
+                ob = self._detect_obstacle()
+                if ob:
+                    self.log(f"🚨 ติด {ob} — ระบบกำลังหยุดรอให้คุณกรอกรหัส...")
+                    self._handle_obstacle(ob, f"{self.HOME_URL}/login")
+                    if self._stop_event.is_set(): return False
+                    time.sleep(3) # รอให้ระบบเซตตัวหลังจากคุณกด Resume
+
+                if self._is_logged_in():
+                    self._save_cookies()
+                    self.log("✅ ล็อกอินสำเร็จและบันทึกคุกกี้เรียบร้อย")
+                    return True
+
+            # ถ้ายังไม่สำเร็จ ให้แสดงเบราว์เซอร์ให้ล็อกอินแบบแมนวลเป็นด่านสุดท้าย
+            if not self._is_logged_in():
+                self.log("⚠️ ล็อกอินไม่สำเร็จ — กรุณาแก้ปัญหาใน Browser ให้เสร็จ แล้วกด Resume")
+                self._handle_obstacle("Login ไม่สำเร็จ — กรุณาจัดการด้วยตัวเอง", f"{self.HOME_URL}/login")
                 if self._stop_event.is_set(): return False
-                time.sleep(2)
+                time.sleep(3)
 
             if self._is_logged_in():
                 self._save_cookies()
-                self.log("✅ ล็อกอินสำเร็จ")
+                self.log("✅ ล็อกอินสำเร็จ (manual) และบันทึกคุกกี้เรียบร้อย")
                 return True
 
-            self.log("⚠️ ล็อกอินไม่สำเร็จ — กรุณาล็อกอินใน Browser แล้วกด Resume")
-            self._handle_obstacle("Login ไม่สำเร็จ — กรุณาล็อกอินด้วยตัวเอง", f"{self.HOME_URL}/login")
-            if self._stop_event.is_set(): return False
-            time.sleep(2)
-            if self._is_logged_in():
-                self._save_cookies()
-                self.log("✅ ล็อกอินสำเร็จ (manual)")
-                return True
+            self.log("❌ สรุปผล: ล็อกอินไม่สำเร็จ เข้าสู่โหมดพักเบรก 5 นาที")
             return False
 
         except TimeoutException:
-            self.log("⚠️ Timeout — กรุณาล็อกอินใน Browser แล้วกด Resume")
+            self.log("⚠️ Timeout — กรุณาล็อกอินใน Browser ให้เสร็จ แล้วกด Resume")
             self._handle_obstacle("Timeout Login", f"{self.HOME_URL}/login")
             if self._stop_event.is_set(): return False
             time.sleep(2)
-            return self._is_logged_in()
+            if self._is_logged_in():
+                self._save_cookies()
+                return True
+            return False
         except Exception as e:
             self.log(f"❌ Login Error: {e}")
             return False
@@ -614,10 +582,25 @@ class FacebookScraper:
             url   = self.driver.current_url.lower()
             title = self.driver.title.lower()
             if "checkpoint"            in url or "checkpoint"  in title: return "Checkpoint"
-            if "two_step_verification" in url or "two_factor"  in url:   return "2FA"
+            if "two_step_verification" in url or "two_factor"  in url or "approvals_code" in url: return "2FA"
             if "captcha"               in url or "captcha"     in title: return "CAPTCHA"
             if "login_attempt"         in url:                           return "Login Attempt Blocked"
             if "suspended"             in url or "disabled"    in url:   return "Account Suspended/Disabled"
+
+            # 🔴 สแกนหน้าเว็บแบบละเอียดเพื่อหา 2FA ที่ URL ไม่เปลี่ยน (เช่น เฟสบุ๊คบัญชีแปลกๆ)
+            is_2fa = self.driver.execute_script("""
+                const t = (document.body.innerText || '').toLowerCase();
+                const hasInput = !!document.querySelector('input[id*="approvals_code"], input[name*="approvals_code"], input[id*="recovery_code"]');
+                const hasText = t.includes('two-factor authentication') ||
+                                t.includes('การยืนยันแบบสองขั้นตอน') ||
+                                t.includes('enter login code') ||
+                                t.includes('ป้อนรหัสเข้าสู่ระบบ') ||
+                                t.includes('รหัส 6 หลัก') ||
+                                t.includes('6-digit code') ||
+                                t.includes('app generator');
+                return hasInput || hasText;
+            """)
+            if is_2fa: return "2FA"
 
             _ID_URL  = ("identity", "identity_verification", "id_verification",
                         "confirm_identity", "verify_identity")
@@ -672,13 +655,8 @@ class FacebookScraper:
         self.hide_browser()
 
     def _handle_cookie_expired(self, page_url: str = ""):
-        """
-        แจ้งเตือนและหยุดรอเมื่อ Cookie หมดอายุ
-        แตกต่างจาก _handle_obstacle() ตรงที่ข้อความและ icon แจ้งเตือน
-        """
         self.log("🍪 Cookie/Session หมดอายุ — กรุณาล็อกอินใน Browser แล้วกด Resume")
         self.show_browser()
-        # navigate ไปหน้า login เพื่อให้ผู้ใช้เห็นชัดว่าต้องทำอะไร
         try: self.driver.get(f"{self.HOME_URL}/login")
         except Exception: pass
         self.discord.send_cookie_expired(page_url)
@@ -866,7 +844,6 @@ class FacebookScraper:
                         self.log(f"📄 [{page_name}] หน้าไม่โหลดเพิ่ม — จบ")
                         break
 
-                # คลิก "ดูเพิ่มเติม" / "See More"
                 try:
                     self.driver.execute_script("""
                         const SM=['ดูเพิ่มเติม','see more','See More','See more',
@@ -886,10 +863,7 @@ class FacebookScraper:
                 except Exception: pass
 
                 # ════════════════════════════════════════════════════════════
-                # ดึงข้อมูลโพสต์ — 3 วิธีเรียงจากแม่นสุด
-                #   A) data-pagelet="FeedUnit_N"  — แม่นสุด comment ผ่านไม่ได้
-                #   B) div[role='feed'] scan       — fallback
-                #   C) global URL-pattern scan     — last resort ไม่ใช้ [data-utime]
+                # ดึงข้อมูลโพสต์ พร้อม NUKE STRATEGY
                 # ════════════════════════════════════════════════════════════
                 try:
                     article_data = self.driver.execute_script("""
@@ -981,7 +955,6 @@ class FacebookScraper:
                                 const artClone = art.cloneNode(true);
 
                                 // 🔴 THE NUKE STRATEGY (สำหรับบัญชีอินเดีย)
-                                // หาแถบที่มีปุ่ม Like/Comment/Share แล้ว "ลบทิ้งพร้อมกับทุกอย่างที่อยู่ด้านล่างมัน"
                                 const allElements = artClone.querySelectorAll('*');
                                 let cutOffNode = null;
                                 const interactionKws = ['Like', 'ถูกใจ', 'Comment', 'ความคิดเห็น', 'Share', 'แชร์', 'Leave a comment'];
@@ -993,7 +966,6 @@ class FacebookScraper:
                                     
                                     if (interactionKws.some(kw => aria.includes(kw)) || role === 'complementary' || role === 'separator') {
                                         let highest = el;
-                                        // ถอยขึ้นไปหา Container หลักของปุ่มนี้
                                         while (highest.parentElement && highest.parentElement !== artClone) {
                                             highest = highest.parentElement;
                                         }
@@ -1002,7 +974,6 @@ class FacebookScraper:
                                     }
                                 }
 
-                                // 🔴 ถ้าเจอแถบปุ่ม ให้ลบแถบนั้น และส่วนล่างทั้งหมดทิ้ง (ซึ่งคือโซนคอมเมนต์)
                                 if (cutOffNode) {
                                     let current = cutOffNode;
                                     while (current) {
@@ -1012,13 +983,11 @@ class FacebookScraper:
                                     }
                                 }
 
-                                // ลบ article ซ้อนที่อาจหลุดรอดมา
                                 const nested = artClone.querySelectorAll("div[role='article']");
                                 for (let i = 0; i < nested.length; i++) {
                                     nested[i].remove();
                                 }
 
-                                // ── สกัดข้อความ (ตอนนี้ปลอดภัย 100% ว่าไม่มีคอมเมนต์เหลือแล้ว) ──
                                 let postText = '';
                                 const msgSelectors = [
                                     '[data-ad-comet-preview="message"]',
@@ -1035,7 +1004,6 @@ class FacebookScraper:
                                     }
                                 }
 
-                                // Fallback คว้า Text ทั้งหมดที่เหลืออยู่
                                 if (!postText) {
                                     const textEls = artClone.querySelectorAll('div[dir="auto"], span[dir="auto"]');
                                     const seen = {};
@@ -1050,7 +1018,6 @@ class FacebookScraper:
                                     postText = lines.join('\\n').trim();
                                 }
                                 
-                                // ถ้าไม่มีอะไรเลยจริงๆ ให้คว้า innerText ของก้อนที่ถูกตัดแล้ว
                                 if (!postText) {
                                     postText = (artClone.innerText || '').trim();
                                 }
@@ -1092,7 +1059,6 @@ class FacebookScraper:
                                     }
                                 }
 
-                                // ส่งคืนค่ากลับไปที่ Python (ส่ง postText ไปทับ allText ด้วยเลยเพื่อป้องกันบั๊ก)
                                 return { postUrl, postText, imageUrl, rawText, allText: postText, utime, timeLabel };
                             });
                         } catch (e) {
@@ -1124,12 +1090,10 @@ class FacebookScraper:
                             if not raw_for_id: continue
                             post_url = f"text_post://{page_name}/{hashlib.md5(raw_for_id.encode()).hexdigest()[:16]}"
 
-                        # normalize domain
                         post_url = (post_url
                                     .replace("web.facebook.com", "www.facebook.com")
                                     .replace("m.facebook.com",   "www.facebook.com"))
 
-                        # normalize URL — เก็บ query params ของ story.php/photo.php
                         if any(x in post_url for x in ("story.php", "photo.php", "permalink/php")):
                             p  = urlparse(post_url)
                             q  = parse_qs(p.query)
@@ -1146,7 +1110,6 @@ class FacebookScraper:
 
                         post_id = self._extract_post_id(post_url_clean)
 
-                        # debug URL format
                         fmt = ("pfbid"     if "pfbid"     in post_url_clean else
                                "story.php" if "story.php" in post_url_clean else
                                "text"      if post_url_clean.startswith("text_post://") else "std")
@@ -1155,7 +1118,6 @@ class FacebookScraper:
                         if self.db.is_seen(post_id) or self.db.is_seen_by_url(post_url_clean):
                             continue
 
-                        # timestamp
                         post_time = self._parse_timestamp(
                             data.get("rawText", ""),
                             utime=int(data.get("utime") or 0),
@@ -1174,11 +1136,9 @@ class FacebookScraper:
                         else:
                             self.log("⚠️ อ่านเวลาไม่ออก — รวมไว้ก่อน")
 
-                        # text
                         post_text = data.get("postText", "").strip() or data.get("allText", "").strip() or data.get("rawText", "").strip()
                         image_url = data.get("imageUrl") or None
 
-                        # keyword filter
                         found_kw = []
                         if keywords:
                             texts = list({
@@ -1191,7 +1151,6 @@ class FacebookScraper:
                                     if kw not in found_kw: found_kw.append(kw)
                             if not found_kw: continue
 
-                        # ตัด timestamp ออกจากต้นข้อความ
                         if post_text:
                             lines = post_text.split("\n")
                             for i, ln in enumerate(lines):
@@ -1208,7 +1167,6 @@ class FacebookScraper:
 
                         self.log(f"📨 keyword: {found_kw} | {post_url_clean[:70]}")
 
-                        # AI
                         ai_result = None
                         if self.ai_analyzer and post_text:
                             ai_result = self.ai_analyzer.analyze(post_text)
@@ -1224,7 +1182,6 @@ class FacebookScraper:
                                     )
                                     self.log("💾 บันทึก Google Sheets")
 
-                        # notify
                         self.discord.send_post(page_name, page_url, post_url_clean,
                                                post_text, found_kw, image_url, ai_result=ai_result)
                         self.tg.send_post(page_name, page_url, post_url_clean,
@@ -1304,16 +1261,13 @@ class FacebookScraper:
                 try:
                     self._start_browser()
 
-                    # ── Cookie / Login ────────────────────────────────────────
                     cookie_existed = os.path.exists(COOKIES_FILE)
                     if not self._load_cookies():
                         if cookie_existed:
-                            # ── Cookie มีแต่ invalid = หมดอายุ ──────────────
                             self.log("🍪 Cookie หมดอายุ — แจ้งเตือนและหยุดรอ Resume")
                             self._handle_cookie_expired()
                             if self._stop_event.is_set(): break
 
-                            # ตรวจ DOM หลัง Resume — navigate ก่อนเพื่อให้ DOM พร้อม
                             self.driver.get(self.HOME_URL)
                             time.sleep(3)
                             if self._is_logged_in():
@@ -1324,10 +1278,9 @@ class FacebookScraper:
                                 if not self.login(email, password):
                                     raise RuntimeError("Login ล้มเหลวหลัง Cookie หมดอายุ")
                         else:
-                            # ── ครั้งแรก ─────────────────────────────────────
                             self.log("🔑 ไม่มี Session เดิม — ล็อกอินใหม่")
                             if not self.login(email, password):
-                                raise RuntimeError("Login ล้มเหลว — ตรวจสอบ Email/Password")
+                                raise RuntimeError("Login ล้มเหลว — ตรวจสอบ Email/Password/2FA")
 
                     time.sleep(1)
                     self.hide_browser()
