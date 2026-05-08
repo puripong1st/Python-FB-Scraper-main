@@ -893,202 +893,211 @@ class FacebookScraper:
                 # ════════════════════════════════════════════════════════════
                 try:
                     article_data = self.driver.execute_script("""
-try {
-    var pn = arguments[0].toLowerCase();
-    var PP = ['/posts/','story_fbid','/permalink/','fbid=',
-              '/share/p/','pfbid','story.php','photo.php','/photos/'];
-    var VP = ['/videos/','/reel/','/watch/','?v=','%3Fv%3D'];
-    var AP = PP.concat(VP);
+                        try {
+                            const pn = arguments[0].toLowerCase();
 
-    // ── Helper: ตรวจว่า element มี ancestor ที่เป็น article ไหม ──────────
-    function hasArticleAncestor(el) {
-        var p = el.parentElement;
-        while (p) {
-            if (p.getAttribute && p.getAttribute('role') === 'article') return true;
-            p = p.parentElement;
-        }
-        return false;
-    }
+                            // ── URL patterns ────────────────────────────────
+                            const POST_PATTERNS = [
+                                '/posts/', 'story_fbid', '/permalink/', 'fbid=',
+                                '/share/p/', '/share/', 'pfbid', 'story.php', 'photo.php', '/photos/',
+                            ];
+                            const VIDEO_PATTERNS = [
+                                '/videos/', '/reel/', '/watch/', '?v=', '%3Fv%3D',
+                            ];
+                            const ALL_PATTERNS = [...POST_PATTERNS, ...VIDEO_PATTERNS];
 
-    // ── วิธี A: data-pagelet="FeedUnit_N" ────────────────────────────────
-    // FB ใส่ label นี้บน wrapper ของแต่ละโพสต์ — comment ไม่มี label นี้
-    var tops = [];
-    var units = document.querySelectorAll(
-        '[data-pagelet^="FeedUnit"],[data-pagelet^="GroupFeedUnit"],' +
-        '[data-pagelet^="MainFeed"],[data-pagelet^="Story"]'
-    );
-    for (var ui = 0; ui < units.length; ui++) {
-        var arts = units[ui].querySelectorAll("div[role='article']");
-        for (var ai = 0; ai < arts.length; ai++) {
-            if (!hasArticleAncestor(arts[ai])) {
-                if (tops.indexOf(arts[ai]) === -1) tops.push(arts[ai]);
-                break;
-            }
-        }
-    }
+                            // ── 1. หา feed container ───────────────────────────────
+                            const feedEl = document.querySelector("div[role='feed']")
+                                        || document.querySelector("div[data-pagelet*='Feed']")
+                                        || document.querySelector("[data-pagelet='ProfileTimeline']")
+                                        || document.querySelector("[data-pagelet='PageTimeline']")
+                                        || document.querySelector("[data-pagelet='GroupFeed']")
+                                        || null;
 
-    // ── วิธี B: div[role='feed'] ─────────────────────────────────────────
-    if (tops.length === 0) {
-        var feed = document.querySelector("div[role='feed']");
-        if (feed) {
-            var allA = feed.querySelectorAll("div[role='article']");
-            for (var i = 0; i < allA.length; i++) {
-                var a = allA[i];
-                if (!hasArticleAncestor(a) && !a.closest('ul') && !a.closest('li')) {
-                    tops.push(a);
-                }
-            }
-        }
-    }
+                            const searchRoot = (feedEl && feedEl.querySelectorAll("div[role='article']").length > 0) ? feedEl : document;
+                            const allArts = Array.from(searchRoot.querySelectorAll("div[role='article']"));
 
-    // ── วิธี C: global scan + URL filter ─────────────────────────────────
-    if (tops.length === 0) {
-        var allArts = document.querySelectorAll("div[role='article']");
-        for (var i = 0; i < allArts.length; i++) {
-            var a = allArts[i];
-            if (hasArticleAncestor(a)) continue;
-            if (a.closest('ul') || a.closest('li')) continue;
-            var links = a.querySelectorAll('a[href]');
-            var hasPost = false;
-            for (var li = 0; li < links.length; li++) {
-                var h = links[li].href || '';
-                for (var pi = 0; pi < AP.length; pi++) {
-                    if (h.indexOf(AP[pi]) !== -1) { hasPost = true; break; }
-                }
-                if (hasPost) break;
-            }
-            if (hasPost) tops.push(a);
-        }
-    }
+                            // ── 2. กรองเฉพาะ top-level posts ───────────────────────────
+                            const topArts = allArts.filter(a => {
+                                if (a.parentElement && a.parentElement.closest("div[role='article']")) return false;
+                                if (a.closest('ul') || a.closest('li')) return false;
 
-    // ── ดึงข้อมูลแต่ละ article ───────────────────────────────────────────
-    var results = [];
-    for (var ti = 0; ti < tops.length; ti++) {
-        try {
-            var art = tops[ti];
-            var anchors = Array.from(art.querySelectorAll('a[href]'));
+                                const ariaLabel = a.getAttribute('aria-label') || '';
+                                if (ariaLabel.includes('Comment') || ariaLabel.includes('ความคิดเห็น')) return false;
 
-            // หา URL
-            var url = '';
-            for (var pi = 0; pi < PP.length && !url; pi++) {
-                for (var li = 0; li < anchors.length && !url; li++) {
-                    if ((anchors[li].href || '').indexOf(PP[pi]) !== -1) url = anchors[li].href;
-                }
-            }
-            if (!url) {
-                for (var li = 0; li < anchors.length && !url; li++) {
-                    var h = anchors[li].href || '';
-                    for (var vi = 0; vi < VP.length; vi++) {
-                        if (h.indexOf(VP[vi]) !== -1) { url = h; break; }
-                    }
-                }
-            }
-            if (!url) {
-                for (var li = 0; li < anchors.length && !url; li++) {
-                    if ((anchors[li].href || '').indexOf('/share/') !== -1) url = anchors[li].href;
-                }
-            }
-            if (!url) {
-                for (var li = 0; li < anchors.length && !url; li++) {
-                    var h = anchors[li].href || '';
-                    if (h.length > 40 && h.toLowerCase().indexOf(pn) !== -1
-                        && !h.endsWith('/' + pn) && !h.endsWith('/' + pn + '/')) url = h;
-                }
-            }
+                                const anchors = Array.from(a.querySelectorAll('a[href]'));
+                                const isComment = anchors.some(anchor => {
+                                    const h = anchor.href || '';
+                                    return h.includes('comment_id=') || h.includes('reply_comment_id=');
+                                });
+                                if (isComment) return false;
 
-            // nested articles = comment sections
-            var nested = Array.from(art.querySelectorAll("div[role='article']"));
-            function inComment(el) {
-                for (var ni = 0; ni < nested.length; ni++) {
-                    if (nested[ni].contains(el)) return true;
-                }
-                return false;
-            }
+                                const hasPostLink = anchors.some(anchor => {
+                                    const h = anchor.href || '';
+                                    return ALL_PATTERNS.some(p => h.includes(p));
+                                });
+                                if (hasPostLink) return true;
+                                if (a.querySelector('abbr[data-utime]')) return true;
 
-            // clone article เพื่อดึง text โดยไม่มี comment
-            var clone = art.cloneNode(true);
-            var cloneNested = clone.querySelectorAll("div[role='article']");
-            for (var ci = 0; ci < cloneNested.length; ci++) cloneNested[ci].parentNode.removeChild(cloneNested[ci]);
-            var cloneReact = clone.querySelectorAll('[aria-label*="omment"],[aria-label*="eaction"]');
-            for (var ci = 0; ci < cloneReact.length; ci++) cloneReact[ci].parentNode.removeChild(cloneReact[ci]);
+                                const hasReactionBar = a.querySelector(
+                                    '[aria-label*="Like"], [aria-label*="ถูกใจ"],' +
+                                    '[aria-label*="Comment"], [aria-label*="ความคิดเห็น"],' +
+                                    '[aria-label*="Share"], [aria-label*="แชร์"]'
+                                );
+                                if (hasReactionBar) return true;
 
-            // post text
-            var txt = '';
-            var msgSels = ['[data-ad-comet-preview="message"]','[data-testid="post_message"]','[data-ad-preview="message"]'];
-            for (var si = 0; si < msgSels.length && !txt; si++) {
-                var el = clone.querySelector(msgSels[si]);
-                if (el) txt = (el.innerText || '').trim();
-            }
-            if (!txt) {
-                var seen = {}, ls = [];
-                var dirEls = clone.querySelectorAll('div[dir="auto"],span[dir="auto"]');
-                for (var di = 0; di < dirEls.length; di++) {
-                    var t = (dirEls[di].innerText || '').trim();
-                    if (t && !seen[t]) { seen[t] = 1; ls.push(t); }
-                }
-                txt = ls.join('\n').trim();
-            }
-            if (!txt) txt = (clone.innerText || '').trim();
+                                return false;
+                            });
 
-            // allText (ไม่มี comment)
-            var allSeen = {}, allLines = [];
-            var allDirEls = art.querySelectorAll('div[dir="auto"],span[dir="auto"]');
-            for (var di = 0; di < allDirEls.length; di++) {
-                if (inComment(allDirEls[di])) continue;
-                var t = (allDirEls[di].innerText || '').trim();
-                if (t && !allSeen[t]) { allSeen[t] = 1; allLines.push(t); }
-            }
+                            return topArts.map(art => {
+                                let postUrl = '';
+                                const anchors = Array.from(art.querySelectorAll('a[href]'));
 
-            // image
-            var img = '';
-            var imgs = art.querySelectorAll('img[src*="scontent"]');
-            for (var ii = 0; ii < imgs.length && !img; ii++) {
-                if (inComment(imgs[ii])) continue;
-                var src = imgs[ii].src || '';
-                if (!src || src.indexOf('emoji') !== -1) continue;
-                var w = parseInt(imgs[ii].getAttribute('width') || '0');
-                if (w && w <= 100) continue;
-                img = src;
-            }
+                                const POST_PRIORITY = [
+                                    '/posts/', 'story_fbid', '/permalink/', 'fbid=',
+                                    'pfbid', 'story.php', 'photo.php', '/share/p/',
+                                ];
+                                for (let i = 0; i < POST_PRIORITY.length; i++) {
+                                    for (let j = 0; j < anchors.length; j++) {
+                                        const h = anchors[j].href || '';
+                                        if (h.includes(POST_PRIORITY[i]) && !h.includes('comment_id=')) { postUrl = h; break; }
+                                    }
+                                    if (postUrl) break;
+                                }
+                                if (!postUrl) {
+                                    for (let j = 0; j < anchors.length; j++) {
+                                        const h = anchors[j].href || '';
+                                        if (VIDEO_PATTERNS.some(p => h.includes(p))) { postUrl = h; break; }
+                                    }
+                                }
+                                if (!postUrl) {
+                                    for (let j = 0; j < anchors.length; j++) {
+                                        const h = anchors[j].href || '';
+                                        if (h.includes('/share/')) { postUrl = h; break; }
+                                    }
+                                }
 
-            // timestamp
-            var raw = (art.innerText || '').split('\\n').slice(0, 10).join('\\n');
-            var ut = 0;
-            var ae = art.querySelector('abbr[data-utime]') || art.querySelector('[data-utime]');
-            if (ae) ut = parseInt(ae.getAttribute('data-utime') || '0');
-            var lbl = '';
-            if (!ut) {
-                var tSels = ['a[role="link"]>span[aria-label]',
-                             'a[href*="/posts/"]>span','a[href*="story_fbid"]>span',
-                             'a[href*="pfbid"]>span','abbr[title]','span[title]','a>abbr'];
-                for (var si = 0; si < tSels.length && !lbl; si++) {
-                    var el = art.querySelector(tSels[si]);
-                    if (!el || inComment(el)) continue;
-                    var v = el.getAttribute('aria-label') || el.getAttribute('title') || el.textContent || '';
-                    v = v.trim();
-                    if (v && (v.match(/[0-9]/) || /ago|yesterday|just now/i.test(v))) { lbl = v; }
-                }
-            }
+                                // 🔴 ตัดความเชื่อมโยงกับ DOM จริง โดยการโคลน
+                                const artClone = art.cloneNode(true);
 
-            results.push({
-                postUrl:   url,
-                postText:  txt,
-                imageUrl:  img,
-                rawText:   raw,
-                allText:   allLines.join('\\n'),
-                utime:     ut,
-                timeLabel: lbl
-            });
-        } catch(artErr) {
-            // ข้าม article ที่ error ไม่ให้ลามทั้ง batch
-        }
-    }
-    return results;
+                                // 🔴 THE NUKE STRATEGY (สำหรับบัญชีอินเดีย)
+                                // หาแถบที่มีปุ่ม Like/Comment/Share แล้ว "ลบทิ้งพร้อมกับทุกอย่างที่อยู่ด้านล่างมัน"
+                                const allElements = artClone.querySelectorAll('*');
+                                let cutOffNode = null;
+                                const interactionKws = ['Like', 'ถูกใจ', 'Comment', 'ความคิดเห็น', 'Share', 'แชร์', 'Leave a comment'];
 
-} catch(e) {
-    // คืน array ว่างถ้า JS ทั้งก้อน error — ไม่ throw ขึ้น Python
-    return [];
-}
+                                for (let i = 0; i < allElements.length; i++) {
+                                    const el = allElements[i];
+                                    const aria = el.getAttribute('aria-label') || '';
+                                    const role = el.getAttribute('role') || '';
+                                    
+                                    if (interactionKws.some(kw => aria.includes(kw)) || role === 'complementary' || role === 'separator') {
+                                        let highest = el;
+                                        // ถอยขึ้นไปหา Container หลักของปุ่มนี้
+                                        while (highest.parentElement && highest.parentElement !== artClone) {
+                                            highest = highest.parentElement;
+                                        }
+                                        cutOffNode = highest;
+                                        break;
+                                    }
+                                }
+
+                                // 🔴 ถ้าเจอแถบปุ่ม ให้ลบแถบนั้น และส่วนล่างทั้งหมดทิ้ง (ซึ่งคือโซนคอมเมนต์)
+                                if (cutOffNode) {
+                                    let current = cutOffNode;
+                                    while (current) {
+                                        let next = current.nextSibling;
+                                        current.remove();
+                                        current = next;
+                                    }
+                                }
+
+                                // ลบ article ซ้อนที่อาจหลุดรอดมา
+                                const nested = artClone.querySelectorAll("div[role='article']");
+                                for (let i = 0; i < nested.length; i++) {
+                                    nested[i].remove();
+                                }
+
+                                // ── สกัดข้อความ (ตอนนี้ปลอดภัย 100% ว่าไม่มีคอมเมนต์เหลือแล้ว) ──
+                                let postText = '';
+                                const msgSelectors = [
+                                    '[data-ad-comet-preview="message"]',
+                                    '[data-testid="post_message"]',
+                                    '[data-ad-preview="message"]',
+                                    'div[data-update-key]',
+                                    'span[data-lexical-text="true"]'
+                                ];
+                                for (let i = 0; i < msgSelectors.length; i++) {
+                                    const el = artClone.querySelector(msgSelectors[i]);
+                                    if (el) {
+                                        const text = (el.innerText || '').trim();
+                                        if (text.length > 0) { postText = text; break; }
+                                    }
+                                }
+
+                                // Fallback คว้า Text ทั้งหมดที่เหลืออยู่
+                                if (!postText) {
+                                    const textEls = artClone.querySelectorAll('div[dir="auto"], span[dir="auto"]');
+                                    const seen = {};
+                                    const lines = [];
+                                    for (let i = 0; i < textEls.length; i++) {
+                                        const t = (textEls[i].innerText || '').trim();
+                                        if (t.length > 0 && !seen[t]) {
+                                            seen[t] = true;
+                                            lines.push(t);
+                                        }
+                                    }
+                                    postText = lines.join('\\n').trim();
+                                }
+                                
+                                // ถ้าไม่มีอะไรเลยจริงๆ ให้คว้า innerText ของก้อนที่ถูกตัดแล้ว
+                                if (!postText) {
+                                    postText = (artClone.innerText || '').trim();
+                                }
+
+                                let imageUrl = '';
+                                for (const img of art.querySelectorAll('img[src*="scontent"]')) {
+                                    const src = img.src || '';
+                                    if (!src || src.includes('emoji')) continue;
+                                    const w = parseInt(img.getAttribute('width') || '0');
+                                    if (w && w <= 100) continue;
+                                    imageUrl = src; break;
+                                }
+
+                                const rawText = (art.innerText || '').split('\\n').slice(0, 10).join('\\n');
+                                let utime = 0;
+                                const abbrEl = art.querySelector('abbr[data-utime]');
+                                if (abbrEl) {
+                                    utime = parseInt(abbrEl.getAttribute('data-utime') || '0');
+                                }
+
+                                let timeLabel = '';
+                                if (!utime) {
+                                    const timeSelectors = [
+                                        'a[role="link"] > span[aria-label]',
+                                        'a[href*="/posts/"] > span',
+                                        'a[href*="story_fbid"] > span',
+                                        'abbr[title]',
+                                        'span[title]',
+                                        'a > abbr',
+                                    ];
+                                    for (let i = 0; i < timeSelectors.length; i++) {
+                                        const el = art.querySelector(timeSelectors[i]);
+                                        if (!el) continue;
+                                        const lbl = el.getAttribute('aria-label') || el.getAttribute('title') || el.textContent || '';
+                                        if (lbl && (/\\d/.test(lbl) || /ago|yesterday|just now/i.test(lbl))) {
+                                            timeLabel = lbl.trim();
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                // ส่งคืนค่ากลับไปที่ Python (ส่ง postText ไปทับ allText ด้วยเลยเพื่อป้องกันบั๊ก)
+                                return { postUrl, postText, imageUrl, rawText, allText: postText, utime, timeLabel };
+                            });
+                        } catch (e) {
+                            return [];
+                        }
                     """, page_name)
 
                     if article_data:
