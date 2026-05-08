@@ -3,6 +3,11 @@ ui/app.py
 ━━━━━━━━━
 ScraperApp — หน้าต่างหลัก CustomTkinter (Modern UI Redesign)
 แบ่งเป็น Header | Left (Tabs) | Right (Log)
+
+[แก้ไข] ระบบซ่อน/แสดง Browser ซิงก์กับปุ่มเสมอ
+  - hide_browser() / show_browser() ทุก call (ทั้งจาก auto หลัง login และจากปุ่ม)
+    จะยิง callback กลับมาที่ UI ผ่าน after(0, ...) (thread-safe)
+  - ปุ่มจะ sync state อัตโนมัติ ไม่ว่า browser จะถูกซ่อน/แสดงจากที่ไหน
 """
 
 import threading
@@ -24,23 +29,21 @@ import os
 import sys
 
 def resource_path(relative_path):
-    """ คืนค่า Path ที่ถูกต้องสำหรับทั้งตอนรันปกติ และตอนรันผ่าน .exe """
     try:
-        # PyInstaller เก็บ Path โฟลเดอร์ชั่วคราวไว้ใน sys._MEIPASS
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.abspath(".")
-
     return os.path.join(base_path, relative_path)
+
 # ── Color tokens ─────────────────────────────────────────────────────────────
 C = {
-    "bg":           "#0a0e1a",   # พื้นหลังหลัก
-    "surface":      "#111827",   # card/panel
-    "surface2":     "#1a2236",   # nested card
-    "border":       "#1f2d45",   # เส้นขอบ
-    "accent":       "#3b82f6",   # น้ำเงิน primary
-    "accent_dark":  "#1d4ed8",   # hover
-    "accent_glow":  "#60a5fa",   # label/icon
+    "bg":           "#0a0e1a",
+    "surface":      "#111827",
+    "surface2":     "#1a2236",
+    "border":       "#1f2d45",
+    "accent":       "#3b82f6",
+    "accent_dark":  "#1d4ed8",
+    "accent_glow":  "#60a5fa",
     "success":      "#22c55e",
     "warning":      "#f59e0b",
     "danger":       "#ef4444",
@@ -110,7 +113,6 @@ class ScraperApp(ctk.CTk):
         hdr.grid_propagate(False)
         hdr.grid_columnconfigure(1, weight=1)
 
-        # Logo + title
         logo_frame = ctk.CTkFrame(hdr, fg_color="transparent")
         logo_frame.grid(row=0, column=0, padx=(18, 0), pady=12, sticky="w")
 
@@ -132,7 +134,6 @@ class ScraperApp(ctk.CTk):
             text_color=C["text_muted"],
         ).pack(anchor="w")
 
-        # Status pill
         self._status_frame = ctk.CTkFrame(hdr, fg_color="#1a2236", corner_radius=20, height=32)
         self._status_frame.grid(row=0, column=1, padx=16, pady=16, sticky="w")
         self._status_frame.grid_propagate(False)
@@ -151,7 +152,6 @@ class ScraperApp(ctk.CTk):
         )
         self._status_lbl.pack(side="left", padx=(0, 10), pady=6)
 
-        # Stats chips
         stats = ctk.CTkFrame(hdr, fg_color="transparent")
         stats.grid(row=0, column=1, padx=(160, 0), pady=16, sticky="w")
 
@@ -159,23 +159,23 @@ class ScraperApp(ctk.CTk):
         self._posts_lbl = self._make_stat_chip(stats, "📰", "0 โพสต์")
         self._cycle_lbl = self._make_stat_chip(stats, "🔄", "รอบ 0")
 
-        # Action buttons
         btn_bar = ctk.CTkFrame(hdr, fg_color="transparent")
         btn_bar.grid(row=0, column=2, padx=(0, 14), pady=12, sticky="e")
 
-        self.start_btn = self._hdr_btn(btn_bar, "▶  Start",     C["accent"],  C["accent_dark"], self._on_start)
+        self.start_btn = self._hdr_btn(btn_bar, "▶  Start",     C["accent"],     C["accent_dark"],  self._on_start)
         self.start_btn.grid(row=0, column=0, padx=(0, 6))
 
-        self.stop_btn = self._hdr_btn(btn_bar, "⏹  Stop",      C["danger"],  C["danger_dark"], self._on_stop, state="disabled")
+        self.stop_btn = self._hdr_btn(btn_bar, "⏹  Stop",       C["danger"],     C["danger_dark"],  self._on_stop, state="disabled")
         self.stop_btn.grid(row=0, column=1, padx=(0, 6))
 
-        self.resume_btn = self._hdr_btn(btn_bar, "▶▶ Resume",   C["orange"],  C["orange_dark"], self._on_resume, state="disabled", width=120)
+        self.resume_btn = self._hdr_btn(btn_bar, "▶▶ Resume",    C["orange"],     C["orange_dark"],  self._on_resume, state="disabled", width=120)
         self.resume_btn.grid(row=0, column=2, padx=(0, 6))
 
-        self.hide_btn = self._hdr_btn(btn_bar, "🙈 ซ่อน",      C["purple"],  C["purple_dark"], self._on_hide_browser, state="disabled", width=100)
+        # ── ปุ่มซ่อน: state และ label จะถูก sync โดย _sync_hide_btn() ──
+        self.hide_btn = self._hdr_btn(btn_bar, "🙈 ซ่อน",       C["purple"],     C["purple_dark"],  self._on_toggle_browser, state="disabled", width=110)
         self.hide_btn.grid(row=0, column=3, padx=(0, 6))
 
-        self.save_btn = self._hdr_btn(btn_bar, "💾 บันทึก",    C["green_dark"], "#166534", self._save_settings, width=100)
+        self.save_btn = self._hdr_btn(btn_bar, "💾 บันทึก",     C["green_dark"], "#166534",         self._save_settings, width=100)
         self.save_btn.grid(row=0, column=4)
 
     def _make_stat_chip(self, parent, icon: str, text: str) -> ctk.CTkLabel:
@@ -231,18 +231,15 @@ class ScraperApp(ctk.CTk):
         self._build_tab_ai()
 
     def _card(self, parent, title: str = None) -> ctk.CTkFrame:
-        """สร้าง card พร้อม optional title"""
         wrap = ctk.CTkFrame(parent, fg_color=C["surface2"], corner_radius=10,
                             border_width=1, border_color=C["border"])
         wrap.pack(fill="x", padx=14, pady=(0, 10))
-
         if title:
             ctk.CTkLabel(
                 wrap, text=title,
                 font=ctk.CTkFont(size=11, weight="bold"),
                 text_color=C["accent_glow"],
             ).pack(anchor="w", padx=14, pady=(10, 6))
-
         inner = ctk.CTkFrame(wrap, fg_color="transparent")
         inner.pack(fill="x", padx=14, pady=(0, 12))
         return inner
@@ -267,31 +264,23 @@ class ScraperApp(ctk.CTk):
     def _divider(self, parent):
         ctk.CTkFrame(parent, height=1, fg_color=C["border"]).pack(fill="x", pady=6)
 
-    # Tab 1 — บัญชี & Timeframe
     def _build_tab_account(self):
         tab = self._tabs.tab("🔐  บัญชี")
         tab.configure(fg_color=C["surface"])
-
         scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent", scrollbar_button_color=C["border"])
         scroll.pack(fill="both", expand=True)
         scroll.grid_columnconfigure(0, weight=1)
 
-        # Facebook credentials
         f1 = self._card(scroll, "🔐  Facebook Login")
         self._label(f1, "Email / ชื่อผู้ใช้")
         self.email_var = ctk.StringVar()
         self._entry(f1, self.email_var, "your@email.com")
-
         self._label(f1, "Password")
         self.pass_var = ctk.StringVar()
         self._entry(f1, self.pass_var, "รหัสผ่าน", show="●")
+        ctk.CTkLabel(f1, text="⚠️  แนะนำใช้บัญชีสำรอง ไม่ใช่บัญชีหลัก",
+                     font=ctk.CTkFont(size=10), text_color=C["warning"]).pack(anchor="w")
 
-        ctk.CTkLabel(
-            f1, text="⚠️  แนะนำใช้บัญชีสำรอง ไม่ใช่บัญชีหลัก",
-            font=ctk.CTkFont(size=10), text_color=C["warning"],
-        ).pack(anchor="w")
-
-        # Timeframe
         f2 = self._card(scroll, "⏱️  ตั้งเวลา")
         row = ctk.CTkFrame(f2, fg_color="transparent")
         row.pack(fill="x")
@@ -314,38 +303,28 @@ class ScraperApp(ctk.CTk):
         ctk.CTkEntry(right_col, textvariable=self.loop_var, height=36,
                      fg_color="#0d1628", border_color=C["border"], text_color=C["text"]).pack(fill="x")
 
-        ctk.CTkLabel(
-            f2, text="💡  แนะนำ: ดึงย้อนหลัง 6 ชม. | วนลูปทุก 30 นาที",
-            font=ctk.CTkFont(size=10), text_color=C["text_muted"],
-        ).pack(anchor="w", pady=(6, 0))
+        ctk.CTkLabel(f2, text="💡  แนะนำ: ดึงย้อนหลัง 6 ชม. | วนลูปทุก 30 นาที",
+                     font=ctk.CTkFont(size=10), text_color=C["text_muted"]).pack(anchor="w", pady=(6, 0))
 
-    # Tab 2 — เพจ & คำค้น
     def _build_tab_pages(self):
         tab = self._tabs.tab("🎯  เพจ & คำค้น")
         tab.configure(fg_color=C["surface"])
-
         scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent", scrollbar_button_color=C["border"])
         scroll.pack(fill="both", expand=True)
 
-        # Pages
         pg_hdr = ctk.CTkFrame(scroll, fg_color=C["surface2"], corner_radius=10,
                                border_width=1, border_color=C["border"])
         pg_hdr.pack(fill="x", padx=14, pady=(0, 10))
-
         ph = ctk.CTkFrame(pg_hdr, fg_color="transparent")
         ph.pack(fill="x", padx=14, pady=(10, 6))
         ph.grid_columnconfigure(0, weight=1)
-
         ctk.CTkLabel(ph, text="🎯  URL เพจเป้าหมาย  (แต่ละบรรทัด = 1 เพจ)",
                      font=ctk.CTkFont(size=11, weight="bold"),
                      text_color=C["accent_glow"]).grid(row=0, column=0, sticky="w")
-
         ctk.CTkButton(ph, text="💾 บันทึกเพจ", width=110, height=28,
                       fg_color=C["accent"], hover_color=C["accent_dark"],
-                      font=ctk.CTkFont(size=10, weight="bold"),
-                      corner_radius=6,
+                      font=ctk.CTkFont(size=10, weight="bold"), corner_radius=6,
                       command=self._save_pages).grid(row=0, column=1, sticky="e")
-
         self.pages_textbox = ctk.CTkTextbox(
             pg_hdr, height=120, fg_color="#0d1628",
             text_color=C["text"], border_color=C["border"], border_width=1,
@@ -354,51 +333,35 @@ class ScraperApp(ctk.CTk):
         self.pages_textbox.pack(fill="x", padx=14, pady=(0, 12))
         self.pages_textbox.insert("1.0", "https://www.facebook.com/BBCnewsThai\nhttps://www.facebook.com/voathai")
 
-        # Keywords
         kw_hdr = ctk.CTkFrame(scroll, fg_color=C["surface2"], corner_radius=10,
                                border_width=1, border_color=C["border"])
         kw_hdr.pack(fill="x", padx=14, pady=(0, 10))
-
         kh = ctk.CTkFrame(kw_hdr, fg_color="transparent")
         kh.pack(fill="x", padx=14, pady=(10, 6))
         kh.grid_columnconfigure(0, weight=1)
-
         ctk.CTkLabel(kh, text="🔑  Keywords  (กด Enter | คั่นด้วย ,)",
                      font=ctk.CTkFont(size=11, weight="bold"),
                      text_color=C["accent_glow"]).grid(row=0, column=0, sticky="w")
-
         ctk.CTkButton(kh, text="💾 บันทึก Keywords", width=130, height=28,
                       fg_color=C["accent"], hover_color=C["accent_dark"],
-                      font=ctk.CTkFont(size=10, weight="bold"),
-                      corner_radius=6,
+                      font=ctk.CTkFont(size=10, weight="bold"), corner_radius=6,
                       command=self._save_keywords).grid(row=0, column=1, sticky="e")
-
-        ctk.CTkLabel(
-            kw_hdr, text="  รองรับ #แฮชแท็ก  |  ถ้าเว้นว่าง = แจ้งทุกโพสต์",
-            font=ctk.CTkFont(size=10), text_color=C["text_muted"],
-        ).pack(anchor="w", padx=14, pady=(0, 4))
-
+        ctk.CTkLabel(kw_hdr, text="  รองรับ #แฮชแท็ก  |  ถ้าเว้นว่าง = แจ้งทุกโพสต์",
+                     font=ctk.CTkFont(size=10), text_color=C["text_muted"]).pack(anchor="w", padx=14, pady=(0, 4))
         self.keywords_widget = KeywordTagInput(
-            kw_hdr,
-            defaults=["เพื่อไทย", "แพทองธาร", "ทักษิณ", "เศรษฐา"],
-        )
+            kw_hdr, defaults=["เพื่อไทย", "แพทองธาร", "ทักษิณ", "เศรษฐา"])
         self.keywords_widget.pack(fill="x", padx=8, pady=(0, 12))
 
-    # Tab 3 — แจ้งเตือน
     def _build_tab_notify(self):
         tab = self._tabs.tab("📡  แจ้งเตือน")
         tab.configure(fg_color=C["surface"])
-
         scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent", scrollbar_button_color=C["border"])
         scroll.pack(fill="both", expand=True)
 
-        # Discord
         dc = self._card(scroll, "💬  Discord Webhook")
-
         dc_row = ctk.CTkFrame(dc, fg_color="transparent")
         dc_row.pack(fill="x")
         dc_row.grid_columnconfigure(0, weight=1)
-
         ctk.CTkLabel(dc_row, text="Webhook URL",
                      font=ctk.CTkFont(size=11), text_color=C["text_muted"]).grid(row=0, column=0, sticky="w")
         ctk.CTkButton(dc_row, text="🧪 ทดสอบ", width=86, height=26,
@@ -406,17 +369,13 @@ class ScraperApp(ctk.CTk):
                       border_width=1, border_color=C["border"],
                       font=ctk.CTkFont(size=10), corner_radius=6,
                       command=self._test_discord).grid(row=0, column=1, sticky="e")
-
         self.webhook_var = ctk.StringVar()
         ctk.CTkEntry(dc, textvariable=self.webhook_var,
                      placeholder_text="https://discord.com/api/webhooks/...",
-                     height=36, fg_color="#0d1628",
-                     border_color=C["border"], text_color=C["text"],
-                     placeholder_text_color=C["text_dim"]).pack(fill="x", pady=(4, 0))
+                     height=36, fg_color="#0d1628", border_color=C["border"],
+                     text_color=C["text"], placeholder_text_color=C["text_dim"]).pack(fill="x", pady=(4, 0))
 
-        # Telegram
         tg = self._card(scroll, "✈️  Telegram Bot")
-
         tg_hdr = ctk.CTkFrame(tg, fg_color="transparent")
         tg_hdr.pack(fill="x")
         tg_hdr.grid_columnconfigure(0, weight=1)
@@ -427,11 +386,9 @@ class ScraperApp(ctk.CTk):
                       border_width=1, border_color=C["border"],
                       font=ctk.CTkFont(size=10), corner_radius=6,
                       command=self._test_telegram).grid(row=0, column=1, sticky="e")
-
         tg_fields = ctk.CTkFrame(tg, fg_color="transparent")
         tg_fields.pack(fill="x", pady=(6, 0))
         tg_fields.grid_columnconfigure((0, 1), weight=1)
-
         left_f = ctk.CTkFrame(tg_fields, fg_color="transparent")
         left_f.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         ctk.CTkLabel(left_f, text="Bot Token",
@@ -441,7 +398,6 @@ class ScraperApp(ctk.CTk):
                      placeholder_text="123456789:ABCdef...", height=36,
                      fg_color="#0d1628", border_color=C["border"],
                      text_color=C["text"], placeholder_text_color=C["text_dim"]).pack(fill="x")
-
         right_f = ctk.CTkFrame(tg_fields, fg_color="transparent")
         right_f.grid(row=0, column=1, sticky="ew", padx=(6, 0))
         ctk.CTkLabel(right_f, text="Chat ID",
@@ -452,31 +408,25 @@ class ScraperApp(ctk.CTk):
                      fg_color="#0d1628", border_color=C["border"],
                      text_color=C["text"], placeholder_text_color=C["text_dim"]).pack(fill="x")
 
-        # Tips
         tip = self._card(scroll)
-        tips = [
+        for icon, txt in [
             ("💡", "Discord: Server Settings → Integrations → Webhooks → New Webhook"),
             ("💡", "Telegram: ส่ง /newbot ให้ @BotFather เพื่อรับ Bot Token"),
             ("💡", "Telegram Chat ID: ใช้ @userinfobot หรือ @getmyid_bot ช่วยได้"),
-        ]
-        for icon, txt in tips:
+        ]:
             r = ctk.CTkFrame(tip, fg_color="transparent")
             r.pack(fill="x", pady=1)
             ctk.CTkLabel(r, text=icon, width=20).pack(side="left")
             ctk.CTkLabel(r, text=txt, font=ctk.CTkFont(size=10),
                          text_color=C["text_muted"], wraplength=360, justify="left").pack(side="left", padx=4)
 
-    # Tab 4 — AI & Sheets
     def _build_tab_ai(self):
         tab = self._tabs.tab("🤖  AI & Sheets")
         tab.configure(fg_color=C["surface"])
-
         scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent", scrollbar_button_color=C["border"])
         scroll.pack(fill="both", expand=True)
 
-        # API Keys
         keys = self._card(scroll, "🔑  API Keys")
-
         ctk.CTkLabel(keys, text="Claude API Key",
                      font=ctk.CTkFont(size=11), text_color=C["text_muted"]).pack(anchor="w", pady=(0, 2))
         self.claude_key_var = ctk.StringVar()
@@ -488,7 +438,6 @@ class ScraperApp(ctk.CTk):
         row = ctk.CTkFrame(keys, fg_color="transparent")
         row.pack(fill="x")
         row.grid_columnconfigure((0, 1), weight=1)
-
         lf = ctk.CTkFrame(row, fg_color="transparent")
         lf.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         ctk.CTkLabel(lf, text="ชื่อ Google Sheet",
@@ -498,7 +447,6 @@ class ScraperApp(ctk.CTk):
                      placeholder_text="ชื่อไฟล์ใน Google Drive", height=36,
                      fg_color="#0d1628", border_color=C["border"],
                      text_color=C["text"], placeholder_text_color=C["text_dim"]).pack(fill="x")
-
         rf = ctk.CTkFrame(row, fg_color="transparent")
         rf.grid(row=0, column=1, sticky="ew", padx=(6, 0))
         ctk.CTkLabel(rf, text="Path ไฟล์ Service Account (.json)",
@@ -509,41 +457,27 @@ class ScraperApp(ctk.CTk):
                      fg_color="#0d1628", border_color=C["border"],
                      text_color=C["text"], placeholder_text_color=C["text_dim"]).pack(fill="x")
 
-        # AI Prompt
         prompt_wrap = ctk.CTkFrame(scroll, fg_color=C["surface2"], corner_radius=10,
                                    border_width=1, border_color=C["border"])
         prompt_wrap.pack(fill="x", padx=14, pady=(0, 10))
-
         ph2 = ctk.CTkFrame(prompt_wrap, fg_color="transparent")
         ph2.pack(fill="x", padx=14, pady=(10, 4))
         ph2.grid_columnconfigure(0, weight=1)
-
         ctk.CTkLabel(ph2, text="🤖  AI Prompt  (Claude จะตอบกลับเป็น JSON)",
                      font=ctk.CTkFont(size=11, weight="bold"),
                      text_color=C["accent_glow"]).grid(row=0, column=0, sticky="w")
-
-        ctk.CTkLabel(
-            prompt_wrap,
-            text="  Claude ต้องตอบกลับเป็น JSON: {is_target, score 1-10, persons[], reason}",
-            font=ctk.CTkFont(size=10), text_color=C["text_muted"],
-        ).pack(anchor="w", padx=14, pady=(0, 4))
-
+        ctk.CTkLabel(prompt_wrap,
+                     text="  Claude ต้องตอบกลับเป็น JSON: {is_target, score 1-10, persons[], reason}",
+                     font=ctk.CTkFont(size=10), text_color=C["text_muted"]).pack(anchor="w", padx=14, pady=(0, 4))
         self.prompt_textbox = ctk.CTkTextbox(
-            prompt_wrap, height=200,
-            fg_color="#0d1628", text_color=C["text"],
-            border_color=C["border"], border_width=1,
-            font=ctk.CTkFont(family="Consolas", size=11),
+            prompt_wrap, height=200, fg_color="#0d1628", text_color=C["text"],
+            border_color=C["border"], border_width=1, font=ctk.CTkFont(family="Consolas", size=11),
         )
         self.prompt_textbox.pack(fill="x", padx=14, pady=(0, 12))
         self.prompt_textbox.insert("1.0", (
             'คุณคือผู้ช่วยบรรณาธิการข่าวการเมืองไทย จงวิเคราะห์ข่าวต่อไปนี้ว่าเกี่ยวข้องกับ "พรรคเพื่อไทย" หรือไม่\n'
             'จงตอบกลับมาเป็นรูปแบบ JSON เท่านั้น:\n'
-            '{\n'
-            '  "is_target": true หรือ false,\n'
-            '  "score": 1-10,\n'
-            '  "persons": ["ชื่อบุคคล"],\n'
-            '  "reason": "สรุปเหตุผลสั้นๆ"\n'
-            '}'
+            '{\n  "is_target": true หรือ false,\n  "score": 1-10,\n  "persons": ["ชื่อบุคคล"],\n  "reason": "สรุปเหตุผลสั้นๆ"\n}'
         ))
 
     # ── Right Panel (Log) ─────────────────────────────────────────────────────
@@ -554,29 +488,21 @@ class ScraperApp(ctk.CTk):
         right.grid_columnconfigure(0, weight=1)
         right.grid_rowconfigure(1, weight=1)
 
-        # Log header
         log_hdr = ctk.CTkFrame(right, fg_color=C["surface2"], height=46, corner_radius=0)
         log_hdr.grid(row=0, column=0, sticky="ew")
         log_hdr.grid_propagate(False)
         log_hdr.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(
-            log_hdr, text="📋  Activity Log",
-            font=ctk.CTkFont(size=12, weight="bold"), text_color=C["text"],
-        ).grid(row=0, column=0, padx=16, pady=10, sticky="w")
-
+        ctk.CTkLabel(log_hdr, text="📋  Activity Log",
+                     font=ctk.CTkFont(size=12, weight="bold"), text_color=C["text"],
+                     ).grid(row=0, column=0, padx=16, pady=10, sticky="w")
         btn_row = ctk.CTkFrame(log_hdr, fg_color="transparent")
         btn_row.grid(row=0, column=1, padx=12, pady=8, sticky="e")
+        ctk.CTkButton(btn_row, text="🗑  ล้าง", width=80, height=30,
+                      fg_color=C["surface"], hover_color=C["border"],
+                      border_width=1, border_color=C["border"],
+                      font=ctk.CTkFont(size=11), corner_radius=6,
+                      command=self._clear_log).pack(side="left", padx=(0, 6))
 
-        ctk.CTkButton(
-            btn_row, text="🗑  ล้าง", width=80, height=30,
-            fg_color=C["surface"], hover_color=C["border"],
-            border_width=1, border_color=C["border"],
-            font=ctk.CTkFont(size=11), corner_radius=6,
-            command=self._clear_log,
-        ).pack(side="left", padx=(0, 6))
-
-        # Log textbox
         self.log_textbox = ctk.CTkTextbox(
             right, state="disabled",
             font=ctk.CTkFont(family="Consolas", size=11),
@@ -584,8 +510,6 @@ class ScraperApp(ctk.CTk):
             border_width=0, corner_radius=0,
         )
         self.log_textbox.grid(row=1, column=0, sticky="nsew")
-
-        # Tag colors for log
         self.log_textbox._textbox.tag_configure("success", foreground="#22c55e")
         self.log_textbox._textbox.tag_configure("error",   foreground="#ef4444")
         self.log_textbox._textbox.tag_configure("warn",    foreground="#f59e0b")
@@ -615,7 +539,6 @@ class ScraperApp(ctk.CTk):
             with open(self.SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(settings, f, ensure_ascii=False, indent=4)
             self._log(f"💾 บันทึก Settings เรียบร้อย → {self.SETTINGS_FILE}", tag="success")
-            # flash save button
             self.save_btn.configure(text="✅ บันทึกแล้ว", fg_color=C["success"])
             self.after(2000, lambda: self.save_btn.configure(text="💾 บันทึก", fg_color=C["green_dark"]))
         except Exception as e:
@@ -763,7 +686,6 @@ class ScraperApp(ctk.CTk):
         self._log_queue.put((f"[{ts}] {message}", tag))
 
     def _poll_log_queue(self):
-        # Map emoji prefixes to tags
         TAG_MAP = {
             "✅": "success", "🟢": "success", "💾": "success",
             "❌": "error",   "🚨": "error",
@@ -774,21 +696,14 @@ class ScraperApp(ctk.CTk):
         try:
             while True:
                 item = self._log_queue.get_nowait()
-                if isinstance(item, tuple):
-                    msg, tag = item
-                else:
-                    msg, tag = item, ""
-
-                # Auto-detect tag from emoji if not provided
+                msg, tag = item if isinstance(item, tuple) else (item, "")
                 if not tag:
                     for emoji, t in TAG_MAP.items():
                         if emoji in msg:
                             tag = t
                             break
-
                 self.log_textbox.configure(state="normal")
-                tb = self.log_textbox._textbox
-                tb.insert("end", msg + "\n", tag if tag else "")
+                self.log_textbox._textbox.insert("end", msg + "\n", tag if tag else "")
                 self.log_textbox.see("end")
                 self.log_textbox.configure(state="disabled")
         except Empty:
@@ -799,6 +714,51 @@ class ScraperApp(ctk.CTk):
         self.log_textbox.configure(state="normal")
         self.log_textbox.delete("1.0", "end")
         self.log_textbox.configure(state="disabled")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Hide / Show browser — Synced button
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _on_toggle_browser(self):
+        """ปุ่มเดียวทำทั้ง hide และ show — state จาก scraper._browser_hidden"""
+        if not self._scraper:
+            return
+        if self._scraper._browser_hidden:
+            self._scraper.show_browser()
+        else:
+            self._scraper.hide_browser()
+
+    def _sync_hide_btn_hidden(self):
+        """
+        เรียกจาก scraper thread ผ่าน after(0, ...) เมื่อ browser ถูกซ่อน
+        ปรับปุ่มเป็น "👁 แสดง" และ enable เสมอ
+        """
+        self.hide_btn.configure(
+            text="👁 แสดง",
+            fg_color=C["success"],
+            hover_color=C["green_dark"],
+            state="normal",
+        )
+
+    def _sync_hide_btn_shown(self):
+        """
+        เรียกจาก scraper thread ผ่าน after(0, ...) เมื่อ browser ถูกแสดง
+        ปรับปุ่มกลับเป็น "🙈 ซ่อน"
+        """
+        self.hide_btn.configure(
+            text="🙈 ซ่อน",
+            fg_color=C["purple"],
+            hover_color=C["purple_dark"],
+            state="normal",
+        )
+
+    def _enable_hide_btn(self):
+        """
+        เรียกเมื่อ cookies ถูกบันทึกครั้งแรก — เปิดใช้งานปุ่ม
+        state ที่แท้จริง (ซ่อน/แสดง) จะ sync ด้วย callback อีกชั้น
+        """
+        self.hide_btn.configure(state="normal")
+        self._log("🍪 Cookies บันทึกแล้ว — สามารถซ่อน Browser ได้", tag="success")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Controls
@@ -846,14 +806,17 @@ class ScraperApp(ctk.CTk):
         ai_analyzer    = ClaudeAnalyzer(claude_key, ai_prompt, self._log) if claude_key else None
         sheets_manager = GoogleSheetsManager(sa_path, sheet_name, self._log) if sa_path and sheet_name else None
 
+        # ── ส่ง callback ซิงก์ปุ่มให้ scraper ──────────────────────────────
+        # ใช้ after(0, ...) เพื่อให้ UI update เกิดบน main thread เสมอ
         self._scraper = FacebookScraper(
             self._log, self._db, discord, tg,
             ai_analyzer=ai_analyzer,
             sheets_manager=sheets_manager,
             on_cookies_saved=self._enable_hide_btn,
+            on_browser_hidden=lambda: self.after(0, self._sync_hide_btn_hidden),
+            on_browser_shown=lambda: self.after(0, self._sync_hide_btn_shown),
         )
 
-        # Update UI state
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.resume_btn.configure(state="normal")
@@ -863,7 +826,11 @@ class ScraperApp(ctk.CTk):
         self._cycle_count        = 0
         self._is_running         = True
 
-        self._log(f"🚀 เริ่มทำงาน | {len(page_urls)} เพจ | Keywords: {keywords or 'ทั้งหมด'} | Loop: {loop_min}m", tag="success")
+        self._log(
+            f"🚀 เริ่มทำงาน | {len(page_urls)} เพจ | "
+            f"Keywords: {keywords or 'ทั้งหมด'} | Loop: {loop_min}m",
+            tag="success",
+        )
 
         self._scraper_thread = threading.Thread(
             target=self._scraper.run,
@@ -888,31 +855,6 @@ class ScraperApp(ctk.CTk):
             self._log("▶️ กด Resume — Scraper กลับมาทำงานแล้ว", tag="info")
             self._set_status("running")
 
-    def _enable_hide_btn(self):
-        self.hide_btn.configure(state="normal")
-        self._log("🍪 Cookies บันทึกแล้ว — สามารถซ่อน Browser ได้", tag="success")
-
-    def _on_hide_browser(self):
-        drv = self._scraper.driver if self._scraper else None
-        if drv:
-            try:
-                drv.set_window_position(-2000, -2000)
-                self._log("🙈 ซ่อน Browser ไปทำงานเบื้องหลังแล้ว", tag="info")
-                self.hide_btn.configure(text="👁 แสดง", command=self._on_show_browser)
-            except Exception as e:
-                self._log(f"⚠️ ซ่อน Browser ไม่สำเร็จ: {e}", tag="warn")
-
-    def _on_show_browser(self):
-        drv = self._scraper.driver if self._scraper else None
-        if drv:
-            try:
-                drv.set_window_position(0, 0)
-                drv.maximize_window()
-                self._log("👁 แสดง Browser กลับมาแล้ว", tag="info")
-                self.hide_btn.configure(text="🙈 ซ่อน", command=self._on_hide_browser)
-            except Exception as e:
-                self._log(f"⚠️ แสดง Browser ไม่สำเร็จ: {e}", tag="warn")
-
     def _check_thread_alive(self):
         if self._scraper_thread and not self._scraper_thread.is_alive():
             self._reset_ui()
@@ -936,7 +878,13 @@ class ScraperApp(ctk.CTk):
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.resume_btn.configure(state="disabled")
-        self.hide_btn.configure(state="disabled", text="🙈 ซ่อน", command=self._on_hide_browser)
+        # reset ปุ่มซ่อนกลับสถานะเริ่มต้น
+        self.hide_btn.configure(
+            text="🙈 ซ่อน",
+            fg_color=C["purple"],
+            hover_color=C["purple_dark"],
+            state="disabled",
+        )
         self._session_start_time = None
         self._set_status("stopped")
 
@@ -948,17 +896,11 @@ class ScraperApp(ctk.CTk):
         dialog.configure(fg_color=C["surface"])
         dialog.grab_set()
         dialog.lift()
-
-        ctk.CTkLabel(
-            dialog, text=msg, wraplength=360,
-            font=ctk.CTkFont(size=12), text_color=C["warning"],
-        ).pack(pady=(24, 12), padx=20)
-
-        ctk.CTkButton(
-            dialog, text="ตกลง", width=100, height=34,
-            fg_color=C["accent"], hover_color=C["accent_dark"],
-            corner_radius=8, command=dialog.destroy,
-        ).pack()
+        ctk.CTkLabel(dialog, text=msg, wraplength=360,
+                     font=ctk.CTkFont(size=12), text_color=C["warning"]).pack(pady=(24, 12), padx=20)
+        ctk.CTkButton(dialog, text="ตกลง", width=100, height=34,
+                      fg_color=C["accent"], hover_color=C["accent_dark"],
+                      corner_radius=8, command=dialog.destroy).pack()
 
     def on_close(self):
         if self._scraper:

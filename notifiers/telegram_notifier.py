@@ -3,6 +3,8 @@ notifiers/telegram_notifier.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 TelegramNotifier  — ส่งข้อความ / รูปภาพพร้อม inline keyboard
 TelegramListener  — polling loop รับ callback query (บันทึก/ลบ)
+
+[แก้ไข] เพิ่ม send_cookie_expired() แจ้งเมื่อ Session/Cookie หมดอายุ
 """
 
 import threading
@@ -154,6 +156,28 @@ class TelegramNotifier:
             f"2️⃣ แก้ไขตามที่หน้าจอแจ้ง\n"
             f"3️⃣ กดปุ่ม <b>Resume</b> บนโปรแกรม"
         )
+
+    # ── NEW: Cookie Expired ───────────────────────────────────────────────────
+
+    def send_cookie_expired(self, page_url: str = ""):
+        """
+        แจ้งเตือนเมื่อ Session/Cookie หมดอายุ
+        ผู้ใช้ต้องเปิด Browser และล็อกอิน Facebook ใหม่ แล้วกด Resume
+        """
+        page_line = f"\n🌐 ขณะสแกนเพจ: {page_url}" if page_url else ""
+        self._send(
+            f"🍪 <b>Session หมดอายุ — ต้องล็อกอินใหม่!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"⏰ เวลา: <b>{datetime.now().strftime('%d/%m/%Y %H:%M:%S')} น.</b>{page_line}\n"
+            f"🔑 สาเหตุ: <b>Cookie Expired / Session Revoked</b>\n\n"
+            f"📌 <b>วิธีแก้ไข:</b>\n"
+            f"1️⃣ เปิดหน้าต่าง Browser ที่โปรแกรมเปิดไว้\n"
+            f"2️⃣ ล็อกอิน Facebook ด้วยตัวเองให้สำเร็จ\n"
+            f"3️⃣ กดปุ่ม <b>Resume</b> บนโปรแกรม\n\n"
+            f"<i>โปรแกรมจะบันทึก Cookie ใหม่และทำงานต่อโดยอัตโนมัติ</i>"
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
 
     def send_stopped(self, total_runtime_sec: float = 0, total_posts_found: int = 0):
         if total_runtime_sec > 0:

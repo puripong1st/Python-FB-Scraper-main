@@ -2,6 +2,8 @@
 notifiers/discord_notifier.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ส่งแจ้งเตือนผ่าน Discord Webhook — embed สีประจำเพจ + AI result
+
+[แก้ไข] เพิ่ม send_cookie_expired() แจ้งเมื่อ Session/Cookie หมดอายุ
 """
 
 import requests
@@ -166,6 +168,49 @@ class DiscordNotifier:
             "timestamp": self._utc_now_iso(),
         }
         self._send({"content": "@everyone", "embeds": [embed]})
+
+    # ── NEW: Cookie Expired ───────────────────────────────────────────────────
+
+    def send_cookie_expired(self, page_url: str = ""):
+        """
+        แจ้งเตือนเมื่อ Session/Cookie หมดอายุ
+        ผู้ใช้ต้องเปิด Browser และล็อกอิน Facebook ใหม่ แล้วกด Resume
+        """
+        page_info = f"\n**ขณะสแกนเพจ:** {page_url}" if page_url else ""
+        embed = {
+            "color": 0xFF6D00,  # ส้มเข้ม — แตกต่างจาก Checkpoint (แดง)
+            "author": {"name": "🍪  Session หมดอายุ — ต้องล็อกอินใหม่!"},
+            "description": (
+                f"**Cookie หมดอายุหรือถูก Facebook Revoke**{page_info}\n\n"
+                "**วิธีแก้ไข:**\n"
+                "1️⃣  เปิดหน้าต่าง Browser ที่โปรแกรมเปิดไว้\n"
+                "2️⃣  ล็อกอิน Facebook ด้วยตัวเองให้สำเร็จ\n"
+                "3️⃣  กดปุ่ม **Resume** บนโปรแกรม\n\n"
+                "*โปรแกรมจะบันทึก Cookie ใหม่และทำงานต่อโดยอัตโนมัติ*"
+            ),
+            "fields": [
+                {
+                    "name": "⏰  เวลาที่พบปัญหา",
+                    "value": f"`{datetime.now().strftime('%d/%m/%Y %H:%M:%S')} น.`",
+                    "inline": True,
+                },
+                {
+                    "name": "🔑  สาเหตุ",
+                    "value": "`Cookie Expired / Session Revoked`",
+                    "inline": True,
+                },
+                {
+                    "name": "💡  เคล็ดลับป้องกัน",
+                    "value": "ใช้บัญชีที่ Active มานาน และลด frequency การสแกน",
+                    "inline": False,
+                },
+            ],
+            "footer": {"text": "FB News Monitor  •  PRP"},
+            "timestamp": self._utc_now_iso(),
+        }
+        self._send({"content": "@everyone", "embeds": [embed]})
+
+    # ─────────────────────────────────────────────────────────────────────────
 
     def send_stopped(self, total_runtime_sec: float = 0, total_posts_found: int = 0):
         if total_runtime_sec > 0:
